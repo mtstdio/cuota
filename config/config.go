@@ -1,0 +1,111 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+type Config struct {
+	Server    ServerConfig    `yaml:"server"`
+	CPA       CPAConfig       `yaml:"cpa"`
+	Quota     QuotaConfig     `yaml:"quota"`
+	Probe     ProbeConfig     `yaml:"probe"`
+	Scheduler SchedulerConfig `yaml:"scheduler"`
+}
+
+type ServerConfig struct {
+	Host     string `yaml:"host"`
+	Port     int    `yaml:"port"`
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+}
+
+type CPAConfig struct {
+	BaseURL   string `yaml:"base_url"`
+	SecretKey string `yaml:"secret_key"`
+	AuthDir   string `yaml:"auth_dir"`
+}
+
+type QuotaConfig struct {
+	PollInterval        time.Duration `yaml:"poll_interval"`
+	MinRemainingPercent float64       `yaml:"min_remaining_percent"`
+	RequestTimeout      time.Duration `yaml:"request_timeout"`
+}
+
+type ProbeConfig struct {
+	Enabled        bool          `yaml:"enabled"`
+	Model          string        `yaml:"model"`
+	Endpoint       string        `yaml:"endpoint"`
+	Timeout        time.Duration `yaml:"timeout"`
+	PostResetDelay time.Duration `yaml:"post_reset_delay"`
+}
+
+type SchedulerConfig struct {
+	Strategy string `yaml:"strategy"`
+}
+
+func DefaultConfig() Config {
+	return Config{
+		Server: ServerConfig{
+			Host:     "0.0.0.0",
+			Port:     8318,
+			Username: "admin",
+			Password: "admin",
+		},
+		CPA: CPAConfig{
+			BaseURL:   "http://127.0.0.1:8317",
+			SecretKey: "",
+			AuthDir:   "~/.cli-proxy-api",
+		},
+		Quota: QuotaConfig{
+			PollInterval:        60 * time.Second,
+			MinRemainingPercent: 2.0,
+			RequestTimeout:      15 * time.Second,
+		},
+		Probe: ProbeConfig{
+			Enabled:        true,
+			Model:          "gpt-5.6-luna",
+			Endpoint:       "https://chatgpt.com/backend-api/codex/responses",
+			Timeout:        30 * time.Second,
+			PostResetDelay: 1 * time.Minute,
+		},
+		Scheduler: SchedulerConfig{
+			Strategy: "fill_first",
+		},
+	}
+}
+
+func ExpandPath(path string) string {
+	if strings.HasPrefix(path, "~/") || path == "~" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			if path == "~" {
+				return home
+			}
+			return filepath.Join(home, path[2:])
+		}
+	}
+	return path
+}
+
+func LoadConfig(path string) (*Config, error) {
+	cfg := DefaultConfig()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &cfg, nil
+		}
+		return nil, err
+	}
+
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+
+	cfg.CPA.AuthDir = ExpandPath(cfg.CPA.AuthDir)
+	return &cfg, nil
+}

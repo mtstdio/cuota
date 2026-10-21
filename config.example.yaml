@@ -1,0 +1,40 @@
+# ====================================================
+# Cuota - Codex 配额管家配置文件
+# ====================================================
+
+server:
+  host: "0.0.0.0"
+  port: 8318
+  # Web 看板与 API 访问认证（HTTP Basic Auth），默认 admin / admin，两者均留空则关闭认证
+  username: "admin"
+  password: "admin"
+
+cpa:
+  # CLIProxyAPI (CPA) 的 HTTP 服务地址（CPA 默认端口为 8317）
+  base_url: "http://127.0.0.1:8317"
+  # CPA Management Key（如果在 CPA 的 config.yaml 中配置了 remote-management.secret-key）
+  secret_key: ""
+  # 本地凭据目录（优先直接读写 Codex auth JSON 文件；留空则纯通过 CPA API 同步）
+  auth_dir: "~/.cli-proxy-api"
+
+quota:
+  # 轮询各账号 5h 与周额度的时间间隔
+  poll_interval: "60s"
+  # 判定 5h 额度耗尽的剩余百分比阈值（低于此百分比立即切入冷却并切换主账号）
+  min_remaining_percent: 2.0
+  # 查询配额请求的超时时间
+  request_timeout: "15s"
+
+probe:
+  # 是否启用 5h 额度自动激活（Probe Ping）
+  enabled: true
+  # 探测使用的轻量模型（消耗极微量 Token 触发倒计时启动）
+  model: "gpt-5.6-luna"
+  # 探测请求接口
+  endpoint: "https://chatgpt.com/backend-api/codex/responses"
+  # 探测请求超时时间
+  timeout: "30s"
+
+scheduler:
+  # 调度策略：fill_first（集中耗尽单个主账号，耗尽即切下个，冷却账号重置后自动 Probe 激活回血）
+  strategy: "fill_first"

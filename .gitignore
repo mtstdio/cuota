@@ -1,0 +1,15 @@
+# Binary
+cuota-server
+
+# Secret tokens and credentials
+.pat
+*.token
+
+# Runtime configuration & local data
+config.yaml
+state.json
+history.json
+
+# OS specific
+.DS_Store
+Thumbs.db
