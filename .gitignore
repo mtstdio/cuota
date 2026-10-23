@@ -13,3 +13,8 @@ history.json
 # OS specific
 .DS_Store
 Thumbs.db
+
+# Frontend build artifacts
+web/frontend/node_modules/
+web/frontend/package-lock.json
+*.tsbuildinfo
