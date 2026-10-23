@@ -99,3 +99,35 @@ func TestExecuteProbe(t *testing.T) {
 		t.Errorf("expected 1 history event, got %d", len(history))
 	}
 }
+
+func TestExecuteProbeSSE(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"total_tokens\":12}}}\n\n"))
+	}))
+	defer mockServer.Close()
+
+	ctrl := NewController(config.ProbeConfig{
+		Enabled:  true,
+		Model:    "gpt-5.6-luna",
+		Endpoint: mockServer.URL,
+	})
+
+	acct := &cpa.Account{
+		ID:          "test-acct-sse",
+		AccessToken: "test-token-456",
+	}
+
+	ev, err := ctrl.Execute(context.Background(), acct)
+	if err != nil {
+		t.Fatalf("unexpected error executing probe: %v", err)
+	}
+
+	if !ev.Success {
+		t.Errorf("expected probe event to succeed, got %v", ev)
+	}
+	if ev.Message != "5h 额度激活成功，实际消耗 12 tokens" {
+		t.Errorf("expected tokens message, got '%s'", ev.Message)
+	}
+}

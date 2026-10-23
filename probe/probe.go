@@ -126,7 +126,7 @@ func (c *Controller) Execute(ctx context.Context, account *cpa.Account) (*Event,
 				},
 			},
 		},
-		"stream": false,
+		"stream": true,
 		"store":  false,
 	}
 
@@ -149,7 +149,7 @@ func (c *Controller) Execute(ctx context.Context, account *cpa.Account) (*Event,
 	req.Header.Set("Authorization", "Bearer "+account.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "text/event-stream, application/json")
 	if account.ChatGPTAccountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", account.ChatGPTAccountID)
 	}
@@ -168,7 +168,7 @@ func (c *Controller) Execute(ctx context.Context, account *cpa.Account) (*Event,
 
 	event.Status = resp.StatusCode
 
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		tokens, hasTokens := parseUsageTokens(body)
@@ -192,10 +192,32 @@ func (c *Controller) Execute(ctx context.Context, account *cpa.Account) (*Event,
 }
 
 func parseUsageTokens(body []byte) (int, bool) {
+	// 1. 如果是标准 JSON
 	var doc map[string]any
-	if err := json.Unmarshal(body, &doc); err != nil {
-		return 0, false
+	if err := json.Unmarshal(body, &doc); err == nil {
+		if t, ok := extractTokensFromDoc(doc); ok {
+			return t, true
+		}
 	}
+
+	// 2. 如果是 SSE (text/event-stream)
+	lines := bytes.Split(body, []byte("\n"))
+	for _, line := range lines {
+		line = bytes.TrimSpace(line)
+		if bytes.HasPrefix(line, []byte("data: ")) {
+			payload := bytes.TrimPrefix(line, []byte("data: "))
+			var sseDoc map[string]any
+			if err := json.Unmarshal(payload, &sseDoc); err == nil {
+				if t, ok := extractTokensFromDoc(sseDoc); ok {
+					return t, true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+func extractTokensFromDoc(doc map[string]any) (int, bool) {
 	paths := [][]string{
 		{"usage", "total_tokens"},
 		{"usage", "input_tokens"},
