@@ -243,17 +243,21 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
+	emptyProvider := func(basis string) map[string]any {
+		return map[string]any{
+			"series":            []any{},
+			"totals":            map[string]any{"requests": 0, "failures": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0, "affinity_hits": 0, "new_sessions": 0, "failovers": 0, "rebinds": 0},
+			"cache_read_share":  0.0,
+			"cache_share_basis": basis,
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"now":   time.Now(),
 		"range": "24h",
 		"step":  "1h",
 		"providers": map[string]any{
-			"codex": map[string]any{
-				"series":            []any{},
-				"totals":            map[string]any{"requests": 0, "input_tokens": 0, "output_tokens": 0},
-				"cache_read_share":  0.0,
-				"cache_share_basis": "cached / input",
-			},
+			"codex":  emptyProvider("cached / input"),
+			"claude": emptyProvider("cached / input"),
 		},
 		"accounts": map[string]any{},
 		"labels":   map[string]string{},

@@ -839,7 +839,7 @@ func (m *Manager) SettingsView() map[string]any {
 			"cpa_base_url":          m.cfg.CPA.BaseURL,
 			"auth_dir":              m.cfg.CPA.AuthDir,
 		},
-		"schema":     map[string]any{},
+		"schema":     []any{},
 		"generation": "1",
 		"patch_path": "/v0/management/plugins/kpatdev-quota-router/config",
 	}

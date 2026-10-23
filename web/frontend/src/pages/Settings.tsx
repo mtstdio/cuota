@@ -90,7 +90,8 @@ export function SettingsPage({ reloadOverview }: PageProps) {
     }
   }
 
-  const groups = groupOrder.map((g) => ({ g, fields: s.schema.filter((f) => f.group === g) })).filter((x) => x.fields.length);
+  const schemaList = Array.isArray(s.schema) ? s.schema : [];
+  const groups = groupOrder.map((g) => ({ g, fields: schemaList.filter((f) => f.group === g) })).filter((x) => x.fields.length);
   return (
     <>
       <div className="settings-grid">

@@ -10,15 +10,15 @@ type Range = "6h" | "24h" | "7d";
 
 export function UsagePage({ now: _now }: PageProps) {
   const [range, setRange] = useState<Range>("24h");
-  const [provider, setProvider] = useState<Provider>("claude");
+  const [provider, setProvider] = useState<Provider>("codex");
   const q = usePoll<Usage>(`/usage?range=${range}`, 30000);
   const u = q.data;
   return (
     <>
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
         <Seg label="Provider" value={provider} onChange={setProvider} options={[
-          { value: "claude", label: <><ProviderMark provider="claude" />Claude</> },
           { value: "codex", label: <><ProviderMark provider="codex" />Codex</> },
+          { value: "claude", label: <><ProviderMark provider="claude" />Claude</> },
         ]} />
         <Seg label="Time range" value={range} onChange={setRange} options={[
           { value: "6h", label: "6 hours" },
@@ -37,7 +37,12 @@ export function UsagePage({ now: _now }: PageProps) {
 }
 
 function ProviderUsage({ u, p }: { u: Usage; p: Provider }) {
-  const d = u.providers[p];
+  const d = u.providers?.[p] ?? {
+    series: [],
+    totals: { requests: 0, failures: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, affinity_hits: 0, new_sessions: 0, failovers: 0, rebinds: 0 },
+    cache_read_share: null,
+    cache_share_basis: "none",
+  };
   const times = d.series.map((x) => x.at);
   const t = d.totals;
   const vals = (k: keyof Counts) => d.series.map((x) => x[k]);
