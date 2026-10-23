@@ -2,6 +2,12 @@
 // memory: never in localStorage, sessionStorage, cookies, or the URL.
 
 export const PLUGIN_ID = "kpatdev-quota-router";
+
+export function getBasePrefix(): string {
+  if (typeof window === "undefined") return "";
+  return window.location.pathname.replace(/\/[^/]*$/, "");
+}
+
 export const API_BASE = `/v0/management/plugins/${PLUGIN_ID}`;
 
 let managementKey = "admin";
@@ -33,7 +39,8 @@ export class ApiError extends Error {
 }
 
 export async function request<T>(path: string, init: { method?: string; body?: unknown; absolute?: boolean } = {}): Promise<T> {
-  const url = init.absolute ? path : API_BASE + path;
+  const base = getBasePrefix();
+  const url = init.absolute ? (path.startsWith("/") ? `${base}${path}` : path) : `${base}${API_BASE}${path}`;
   const headers: Record<string, string> = { Authorization: `Bearer ${managementKey}` };
   if (init.body !== undefined) headers["Content-Type"] = "application/json";
   let res: Response;

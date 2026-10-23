@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -123,10 +124,38 @@ func (s *Server) Start(ctx context.Context) error {
 		http.NotFound(w, r)
 	})
 
+	basePath := config.CleanBasePath(s.cfg.BasePath)
+
+	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if basePath != "" {
+			if r.URL.Path == basePath {
+				target := basePath + "/"
+				if r.URL.RawQuery != "" {
+					target += "?" + r.URL.RawQuery
+				}
+				http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+				return
+			}
+			if strings.HasPrefix(r.URL.Path, basePath+"/") {
+				r2 := new(http.Request)
+				*r2 = *r
+				r2.URL = new(url.URL)
+				*r2.URL = *r.URL
+				r2.URL.Path = strings.TrimPrefix(r.URL.Path, basePath)
+				if r2.URL.Path == "" {
+					r2.URL.Path = "/"
+				}
+				mux.ServeHTTP(w, r2)
+				return
+			}
+		}
+		mux.ServeHTTP(w, r)
+	})
+
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 	s.srv = &http.Server{
 		Addr:         addr,
-		Handler:      s.basicAuthMiddleware(mux),
+		Handler:      s.basicAuthMiddleware(rootHandler),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 	}
@@ -138,7 +167,11 @@ func (s *Server) Start(ctx context.Context) error {
 		_ = s.srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("[Web] Management Dashboard and API listening on http://%s", addr)
+	if basePath != "" {
+		log.Printf("[Web] Management Dashboard and API listening on http://%s%s (and http://%s/)", addr, basePath, addr)
+	} else {
+		log.Printf("[Web] Management Dashboard and API listening on http://%s", addr)
+	}
 	if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}

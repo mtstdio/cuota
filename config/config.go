@@ -20,6 +20,7 @@ type Config struct {
 type ServerConfig struct {
 	Host     string `yaml:"host"`
 	Port     int    `yaml:"port"`
+	BasePath string `yaml:"base_path"`
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
 }
@@ -92,11 +93,24 @@ func ExpandPath(path string) string {
 	return path
 }
 
+func CleanBasePath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" || p == "/" {
+		return ""
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return strings.TrimRight(p, "/")
+}
+
 func LoadConfig(path string) (*Config, error) {
 	cfg := DefaultConfig()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// Apply env vars even if config file doesn't exist
+			applyEnvOverrides(&cfg)
 			return &cfg, nil
 		}
 		return nil, err
@@ -107,5 +121,16 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	cfg.CPA.AuthDir = ExpandPath(cfg.CPA.AuthDir)
+	applyEnvOverrides(&cfg)
 	return &cfg, nil
+}
+
+func applyEnvOverrides(cfg *Config) {
+	for _, envKey := range []string{"BASE_PATH", "PATH_PREFIX", "CUOTA_BASE_PATH", "SERVER_BASE_PATH"} {
+		if val := strings.TrimSpace(os.Getenv(envKey)); val != "" {
+			cfg.Server.BasePath = val
+			break
+		}
+	}
+	cfg.Server.BasePath = CleanBasePath(cfg.Server.BasePath)
 }

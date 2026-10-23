@@ -78,3 +78,30 @@ scheduler:
 		t.Errorf("expected model gpt-5-mini, got %s", cfg.Probe.Model)
 	}
 }
+
+func TestBasePathEnvAndClean(t *testing.T) {
+	if CleanBasePath("") != "" {
+		t.Errorf("expected empty string")
+	}
+	if CleanBasePath("/") != "" {
+		t.Errorf("expected empty string")
+	}
+	if CleanBasePath("/cuota") != "/cuota" {
+		t.Errorf("expected /cuota, got %s", CleanBasePath("/cuota"))
+	}
+	if CleanBasePath("/cuota/") != "/cuota" {
+		t.Errorf("expected /cuota, got %s", CleanBasePath("/cuota/"))
+	}
+	if CleanBasePath("cuota") != "/cuota" {
+		t.Errorf("expected /cuota, got %s", CleanBasePath("cuota"))
+	}
+
+	t.Setenv("BASE_PATH", "/my-cuota/")
+	cfg, err := LoadConfig("non_existent.yaml")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Server.BasePath != "/my-cuota" {
+		t.Errorf("expected /my-cuota, got %s", cfg.Server.BasePath)
+	}
+}

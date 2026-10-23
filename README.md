@@ -95,6 +95,7 @@ docker run -d \
   --name cuota-server \
   --restart unless-stopped \
   -p 8318:8318 \
+  -e BASE_PATH=/cuota \
   -v $(pwd)/config.yaml:/app/config.yaml:ro \
   -v ~/.cli-proxy-api:/root/.cli-proxy-api \
   ghcr.io/mtstdio/cuota:latest
@@ -105,15 +106,21 @@ docker run -d \
 docker compose up -d
 ```
 
-启动后在浏览器打开：`http://localhost:8318` 查看 Web 管理看板（默认账密 `admin` / `admin`）。
+启动后在浏览器打开：`http://localhost:8318`（若配置了 `BASE_PATH=/cuota`，则访问 `http://localhost:8318/cuota/`，两者兼容），默认账密 `admin` / `admin`。
 
 ---
 
 ## REST API 接口
 
+系统同时支持标准 RESTful 接口与 Quota-Router 插件管理接口（支持自定义挂载子路径，如 `/cuota/api/...`）：
+
 | 接口 | 方法 | 请求体 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `/api/status` | `GET` | 无 | 获取当前主力账号、所有账号配额倒计时与 Probe 历史日志 |
+| `/api/overview` | `GET` | 无 | 获取跨渠道主力账号卡片、就绪/冷却统计与 5h 重置倒计时 |
+| `/api/accounts` | `GET` | 无 | 获取账号列表、5h 与周配额详细进度、健康状态与权重 |
+| `/api/activity` | `GET` | `?limit=200` | 获取最近调度决策与 5h 激活事件时间轴 |
+| `/api/settings` | `GET` | 无 | 查看当前系统配置参数 |
+| `/api/status` | `GET` | 无 | 兼容接口：获取主力账号状态与原始 Probe 历史日志 |
 | `/api/probe` | `POST` | `{"account_id": "codex-1.json"}` | 对指定账号手动触发一次 5h 激活 Probe |
 | `/api/switch` | `POST` | `{"account_id": "codex-1.json"}` | 手动将指定账号指定为最高优先级主力账号 |
 | `/api/account/toggle` | `POST` | `{"account_id": "...", "disabled": true/false}` | 手动启用或停用指定账号 |
