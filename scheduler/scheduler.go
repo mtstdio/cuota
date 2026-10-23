@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -13,6 +14,25 @@ import (
 	"cuota-server/probe"
 	"cuota-server/quota"
 )
+
+type DecisionView struct {
+	ID               uint64    `json:"id"`
+	At               time.Time `json:"at"`
+	Provider         string    `json:"provider"`
+	Model            string    `json:"model"`
+	Stream           bool      `json:"stream"`
+	Mode             string    `json:"mode"`
+	Policy           string    `json:"policy"`
+	Outcome          string    `json:"outcome"`
+	Cause            string    `json:"cause,omitempty"`
+	AuthID           string    `json:"auth_id,omitempty"`
+	BoundAuthID      string    `json:"bound_auth_id,omitempty"`
+	Applied          bool      `json:"applied"`
+	AffinityOverrode bool      `json:"affinity_overrode_ranking"`
+	Fallback         bool      `json:"fallback,omitempty"`
+	Ranked           []any     `json:"ranked"`
+	Skipped          []any     `json:"skipped"`
+}
 
 type AccountState string
 
@@ -36,14 +56,16 @@ type ManagedAccount struct {
 }
 
 type Manager struct {
-	cfg          *config.Config
-	cpaClient    *cpa.Client
-	fetcher      *quota.Fetcher
-	prober       *probe.Controller
-	mu           sync.RWMutex
-	accounts     map[string]*ManagedAccount
-	activeAcctID string
-	refreshCh    chan struct{}
+	cfg            *config.Config
+	cpaClient      *cpa.Client
+	fetcher        *quota.Fetcher
+	prober         *probe.Controller
+	mu             sync.RWMutex
+	accounts       map[string]*ManagedAccount
+	activeAcctID   string
+	refreshCh      chan struct{}
+	decisions      []DecisionView
+	nextDecisionID uint64
 }
 
 func NewManager(cfg *config.Config, cpaClient *cpa.Client, fetcher *quota.Fetcher, prober *probe.Controller) *Manager {
@@ -54,6 +76,36 @@ func NewManager(cfg *config.Config, cpaClient *cpa.Client, fetcher *quota.Fetche
 		prober:    prober,
 		accounts:  make(map[string]*ManagedAccount),
 		refreshCh: make(chan struct{}, 1),
+		decisions: make([]DecisionView, 0, 200),
+	}
+}
+
+func (m *Manager) recordDecision(d DecisionView) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recordDecisionLocked(d)
+}
+
+func (m *Manager) recordDecisionLocked(d DecisionView) {
+	m.nextDecisionID++
+	d.ID = m.nextDecisionID
+	if d.At.IsZero() {
+		d.At = time.Now()
+	}
+	if d.Provider == "" {
+		d.Provider = "codex"
+	}
+	if d.Policy == "" && m.cfg != nil {
+		d.Policy = m.cfg.Scheduler.Strategy
+	}
+	if d.Mode == "" {
+		d.Mode = "active"
+	}
+	d.Applied = true
+
+	m.decisions = append([]DecisionView{d}, m.decisions...)
+	if len(m.decisions) > 200 {
+		m.decisions = m.decisions[:200]
 	}
 }
 
@@ -149,6 +201,13 @@ func (m *Manager) reconcileSingleAccount(ctx context.Context, acct *cpa.Account)
 	// 1. 冷却到期直接激活 (Cooldown Expiration Immediate Probe)
 	if managed.State == StateCooldown && !managed.LockedResetAt.IsZero() && now.After(managed.LockedResetAt) && q.FiveHour != nil && q.FiveHour.UsedPercent == 0 {
 		log.Printf("[Scheduler] Account %s reached cooldown reset time with 0%% usage, triggering probe...", acct.ID)
+		m.recordDecision(DecisionView{
+			Provider: "codex",
+			Model:    m.cfg.Probe.Model,
+			Outcome:  "new_session",
+			Cause:    fmt.Sprintf("账号 %s 5h 冷却周期结束到达重置点，自动触发 Probe 激活", acct.ID),
+			AuthID:   acct.ID,
+		})
 		m.executeProbeAndRefresh(ctx, acct, managed)
 		return
 	}
@@ -158,6 +217,13 @@ func (m *Manager) reconcileSingleAccount(ctx context.Context, acct *cpa.Account)
 		drift := q.FiveHour.ResetAt.Sub(managed.LastResetAt)
 		if drift >= 3*time.Second {
 			log.Printf("[Scheduler] Account %s detected reset drift (+%v), lazy window confirmed, triggering probe...", acct.ID, drift)
+			m.recordDecision(DecisionView{
+				Provider: "codex",
+				Model:    m.cfg.Probe.Model,
+				Outcome:  "new_session",
+				Cause:    fmt.Sprintf("账号 %s 5h 倒计时未启动（重置点向后漂移 +%v），自动触发 Probe 激活", acct.ID, drift.Round(time.Second)),
+				AuthID:   acct.ID,
+			})
 			m.executeProbeAndRefresh(ctx, acct, managed)
 			return
 		}
@@ -199,6 +265,15 @@ func (m *Manager) reconcileSingleAccount(ctx context.Context, acct *cpa.Account)
 
 	if currentState == StateCooldown || currentState == StateError || currentState == "" {
 		m.setAccountState(acct.ID, StateReady, "额度健康就绪")
+		if currentState == StateCooldown {
+			m.recordDecision(DecisionView{
+				Provider: "codex",
+				Model:    "codex",
+				Outcome:  "rebind",
+				Cause:    fmt.Sprintf("账号 %s 5h 额度已刷新恢复，状态解除冷却转为就绪待命", acct.ID),
+				AuthID:   acct.ID,
+			})
+		}
 	}
 }
 
@@ -211,6 +286,9 @@ func (m *Manager) evaluateActiveAccount() {
 		currentActive = m.accounts[m.activeAcctID]
 	}
 
+	var oldActiveID string
+	var oldRemaining float64
+
 	// 检查当前主账号是否依然健康
 	if currentActive != nil && currentActive.State == StateActive {
 		minRemaining := m.cfg.Quota.MinRemainingPercent
@@ -221,6 +299,8 @@ func (m *Manager) evaluateActiveAccount() {
 				currentActive.State = StateCooldown
 				currentActive.StateDesc = "5h 额度耗尽，已切入冷却"
 				_ = m.cpaClient.UpdateAccountStatus(currentActive.Account.ID, true, 0)
+				oldActiveID = currentActive.Account.ID
+				oldRemaining = remaining
 				currentActive = nil
 				m.activeAcctID = ""
 			}
@@ -268,6 +348,26 @@ func (m *Manager) evaluateActiveAccount() {
 		m.activeAcctID = newActive.Account.ID
 		log.Printf("[Scheduler] Promoted account %s as PRIMARY ACTIVE (priority=100)", newActive.Account.ID)
 		_ = m.cpaClient.UpdateAccountStatus(newActive.Account.ID, false, 100)
+
+		if oldActiveID != "" {
+			m.recordDecisionLocked(DecisionView{
+				Provider:    "codex",
+				Model:       "codex",
+				Outcome:     "failover",
+				Cause:       fmt.Sprintf("主力账号 %s 5h 额度耗尽(剩余 %.1f%%)，自动熔断；推举 %s 晋升为主力账号", oldActiveID, oldRemaining, newActive.Account.ID),
+				AuthID:      newActive.Account.ID,
+				BoundAuthID: oldActiveID,
+				Fallback:    true,
+			})
+		} else {
+			m.recordDecisionLocked(DecisionView{
+				Provider: "codex",
+				Model:    "codex",
+				Outcome:  "new_session",
+				Cause:    fmt.Sprintf("推举可用账号 %s 晋升为主力账号", newActive.Account.ID),
+				AuthID:   newActive.Account.ID,
+			})
+		}
 	}
 
 	// 其他 ready 账号设为备用可用 (priority=10)
@@ -313,6 +413,13 @@ func (m *Manager) ManualSwitch(accountID string) error {
 	target.State = StateActive
 	target.StateDesc = "手动指定主力"
 	m.activeAcctID = accountID
+	m.recordDecisionLocked(DecisionView{
+		Provider: "codex",
+		Model:    "codex",
+		Outcome:  "rebind",
+		Cause:    fmt.Sprintf("管理员手动指定 %s 为当前主力账号", accountID),
+		AuthID:   accountID,
+	})
 	m.mu.Unlock()
 
 	log.Printf("[Scheduler] Manually switched active account to %s", accountID)
@@ -352,6 +459,14 @@ func (m *Manager) ManualProbe(ctx context.Context, accountID string) (*probe.Eve
 		return nil, fmt.Errorf("account not found: %s", accountID)
 	}
 
+	m.recordDecision(DecisionView{
+		Provider: "codex",
+		Model:    m.cfg.Probe.Model,
+		Outcome:  "new_session",
+		Cause:    fmt.Sprintf("管理员手动触发账号 %s 的 Probe 激活探测", accountID),
+		AuthID:   accountID,
+	})
+
 	ev, err := m.prober.Execute(ctx, ma.Account)
 	if err == nil && ev.Success {
 		m.mu.Lock()
@@ -384,7 +499,9 @@ func (m *Manager) ToggleAccount(accountID string, disabled bool) error {
 		m.mu.Unlock()
 		return fmt.Errorf("account not found: %s", accountID)
 	}
+	action := "启用"
 	if disabled {
+		action = "禁用"
 		ma.State = StateDisabled
 		ma.StateDesc = "已手动禁用"
 		if m.activeAcctID == accountID {
@@ -394,6 +511,13 @@ func (m *Manager) ToggleAccount(accountID string, disabled bool) error {
 		ma.State = StateReady
 		ma.StateDesc = "已启用待命"
 	}
+	m.recordDecisionLocked(DecisionView{
+		Provider: "codex",
+		Model:    "codex",
+		Outcome:  "delegated",
+		Cause:    fmt.Sprintf("管理员手动%s账号 %s", action, accountID),
+		AuthID:   accountID,
+	})
 	m.mu.Unlock()
 
 	err := m.cpaClient.UpdateAccountStatus(accountID, disabled, 0)
@@ -423,4 +547,321 @@ func (m *Manager) Snapshot() (activeID string, list []*ManagedAccount, probeLogs
 
 	probeLogs = m.prober.History()
 	return activeID, list, probeLogs
+}
+
+func (m *Manager) Overview() map[string]any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	now := time.Now()
+	accounts := m.buildAccountViewsLocked(now)
+
+	summary := map[string]any{
+		"codex": map[string]any{
+			"total":           0,
+			"eligible":        0,
+			"limited":         0,
+			"exhausted":       0,
+			"blocked":         0,
+			"unknown":         0,
+			"active_sessions": 0,
+			"expiring_soon":   0,
+		},
+		"claude": map[string]any{
+			"total":           0,
+			"eligible":        0,
+			"limited":         0,
+			"exhausted":       0,
+			"blocked":         0,
+			"unknown":         0,
+			"active_sessions": 0,
+			"expiring_soon":   0,
+		},
+	}
+
+	codexSum := summary["codex"].(map[string]any)
+	resets := make([]map[string]any, 0)
+	var lastRefresh *time.Time
+
+	for _, a := range accounts {
+		codexSum["total"] = codexSum["total"].(int) + 1
+		state := a["quota_state"].(string)
+		routing := a["routing"].(string)
+		switch {
+		case state == "exhausted":
+			codexSum["exhausted"] = codexSum["exhausted"].(int) + 1
+		case routing == "eligible":
+			codexSum["eligible"] = codexSum["eligible"].(int) + 1
+		case routing == "blocked":
+			codexSum["blocked"] = codexSum["blocked"].(int) + 1
+		case state == "unknown" || state == "stale":
+			codexSum["unknown"] = codexSum["unknown"].(int) + 1
+		default:
+			codexSum["limited"] = codexSum["limited"].(int) + 1
+		}
+
+		if nr, ok := a["next_reset"].(*time.Time); ok && nr != nil {
+			if nr.After(now) && nr.Sub(now) <= 24*time.Hour {
+				resets = append(resets, map[string]any{
+					"auth_id":           a["id"],
+					"account":           a["display"],
+					"provider":          "codex",
+					"resets_at":         nr,
+					"remaining_percent": a["remaining_percent"],
+				})
+			}
+		}
+
+		if lp, ok := a["last_poll_at"].(*time.Time); ok && lp != nil {
+			if lastRefresh == nil || lp.After(*lastRefresh) {
+				lastRefresh = lp
+			}
+		}
+	}
+
+	nextUp := make([]map[string]any, 0)
+	if m.activeAcctID != "" {
+		nextUp = append(nextUp, map[string]any{
+			"provider": "codex",
+			"model":    "gpt-5.6-luna",
+			"policy":   m.cfg.Scheduler.Strategy,
+			"auth_id":  m.activeAcctID,
+			"account":  m.activeAcctID,
+			"reason":   "Primary active account",
+			"fallback": false,
+			"ranked":   []any{},
+			"skipped":  []any{},
+		})
+	}
+
+	return map[string]any{
+		"now": now,
+		"plugin": map[string]any{
+			"version":                    "2.1.0",
+			"started_at":                 now,
+			"worker_running":             true,
+			"worker_failed":              false,
+			"state_writable":             true,
+			"schedule_across_priorities": true,
+		},
+		"mode":         "active",
+		"policy":       m.cfg.Scheduler.Strategy,
+		"roster":       map[string]any{"ok": true, "at": now},
+		"counters":     map[string]any{"picks": len(m.decisions), "routed": len(m.decisions)},
+		"summary":      summary,
+		"upcoming":     resets,
+		"last_refresh": lastRefresh,
+		"next_up":      nextUp,
+		"accounts":     accounts,
+		"affinity": map[string]any{
+			"enabled": false,
+			"ttl":     "24h",
+			"scope":   "session",
+		},
+	}
+}
+
+func (m *Manager) AccountsView() []map[string]any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.buildAccountViewsLocked(time.Now())
+}
+
+func (m *Manager) buildAccountViewsLocked(now time.Time) []map[string]any {
+	list := make([]map[string]any, 0)
+	for _, ma := range m.accounts {
+		acct := ma.Account
+		if acct == nil {
+			continue
+		}
+
+		display := acct.Email
+		if display == "" {
+			display = acct.ID
+		}
+
+		windows := make([]map[string]any, 0)
+		var nextReset *time.Time
+		remPercent := 100.0
+
+		if ma.Quota != nil {
+			if ma.Quota.FiveHour != nil {
+				used := ma.Quota.FiveHour.UsedPercent
+				rem := math.Max(0, 100.0-used)
+				remPercent = rem
+				resetsAt := ma.Quota.FiveHour.ResetAt
+				if !resetsAt.IsZero() {
+					nextReset = &resetsAt
+				}
+				windows = append(windows, map[string]any{
+					"key":               "five_hour",
+					"kind":              "five_hour",
+					"label":             "5-Hour Quota",
+					"used_percent":      used,
+					"remaining_percent": rem,
+					"resets_at":         nextReset,
+					"source":            "poll",
+					"observed_at":       ma.Quota.FetchedAt,
+					"stale":             false,
+					"reset_passed":      !resetsAt.IsZero() && now.After(resetsAt),
+				})
+			}
+			if ma.Quota.Weekly != nil {
+				used := ma.Quota.Weekly.UsedPercent
+				rem := math.Max(0, 100.0-used)
+				var wReset *time.Time
+				if !ma.Quota.Weekly.ResetAt.IsZero() {
+					t := ma.Quota.Weekly.ResetAt
+					wReset = &t
+				}
+				windows = append(windows, map[string]any{
+					"key":               "weekly",
+					"kind":              "weekly",
+					"label":             "Weekly Quota",
+					"used_percent":      used,
+					"remaining_percent": rem,
+					"resets_at":         wReset,
+					"source":            "poll",
+					"observed_at":       ma.Quota.FetchedAt,
+					"stale":             false,
+					"reset_passed":      wReset != nil && now.After(*wReset),
+				})
+			}
+		}
+
+		quotaState := "ready"
+		routing := "eligible"
+		switch ma.State {
+		case StateCooldown:
+			quotaState = "exhausted"
+			routing = "limited"
+		case StateDisabled:
+			quotaState = "ready"
+			routing = "blocked"
+		case StateError:
+			quotaState = "stale"
+			routing = "limited"
+		case StateActive:
+			quotaState = "ready"
+			routing = "eligible"
+		case StateReady:
+			quotaState = "ready"
+			routing = "eligible"
+		}
+
+		plan := "Codex Subscription"
+		if ma.Quota != nil && ma.Quota.PlanType != "" {
+			plan = ma.Quota.PlanType
+		}
+
+		var lastPoll *time.Time
+		if ma.Quota != nil && !ma.Quota.FetchedAt.IsZero() {
+			t := ma.Quota.FetchedAt
+			lastPoll = &t
+		}
+
+		isPreferred := (m.activeAcctID == acct.ID)
+
+		item := map[string]any{
+			"id":                acct.ID,
+			"display":           display,
+			"alias":             acct.Email,
+			"provider":          "codex",
+			"plan":              plan,
+			"present":           true,
+			"disabled":          acct.Disabled,
+			"unavailable":       false,
+			"host_priority":     acct.Priority,
+			"plugin_priority":   acct.Priority,
+			"polled":            ma.Quota != nil,
+			"poll_error":        ma.StateDesc,
+			"last_poll_at":      lastPoll,
+			"last_refresh_at":   lastPoll,
+			"last_observed_at":  lastPoll,
+			"windows":           windows,
+			"quota_state":       quotaState,
+			"quota_reason":      ma.StateDesc,
+			"routing":           routing,
+			"routing_reason":    ma.StateDesc,
+			"next_reset":        nextReset,
+			"remaining_percent": remPercent,
+			"expiring_soon":     nextReset != nil && nextReset.After(now) && nextReset.Sub(now) <= 24*time.Hour,
+			"active_sessions":   0,
+			"preferred":         isPreferred,
+			"rank":              1,
+			"health": map[string]any{
+				"auth_failed":     ma.State == StateError,
+				"auth_suspect":    false,
+				"last_success_at": lastPoll,
+			},
+			"burn": map[string]any{},
+		}
+		list = append(list, item)
+	}
+
+	sort.Slice(list, func(i, j int) bool {
+		prefI := list[i]["preferred"].(bool)
+		prefJ := list[j]["preferred"].(bool)
+		if prefI != prefJ {
+			return prefI
+		}
+		return list[i]["remaining_percent"].(float64) > list[j]["remaining_percent"].(float64)
+	})
+
+	return list
+}
+
+func (m *Manager) Decisions(limit int) []DecisionView {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if limit <= 0 || limit > len(m.decisions) {
+		limit = len(m.decisions)
+	}
+	res := make([]DecisionView, limit)
+	copy(res, m.decisions[:limit])
+	return res
+}
+
+func (m *Manager) SettingsView() map[string]any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return map[string]any{
+		"config": map[string]any{
+			"mode":                  "active",
+			"strategy":              m.cfg.Scheduler.Strategy,
+			"poll_interval":         m.cfg.Quota.PollInterval.String(),
+			"min_remaining_percent": m.cfg.Quota.MinRemainingPercent,
+			"probe_enabled":         m.cfg.Probe.Enabled,
+			"probe_model":           m.cfg.Probe.Model,
+			"probe_endpoint":        m.cfg.Probe.Endpoint,
+			"cpa_base_url":          m.cfg.CPA.BaseURL,
+			"auth_dir":              m.cfg.CPA.AuthDir,
+		},
+		"schema":     map[string]any{},
+		"generation": "1",
+		"patch_path": "/v0/management/plugins/kpatdev-quota-router/config",
+	}
+}
+
+func (m *Manager) Labels() map[string]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	labels := make(map[string]string)
+	for _, ma := range m.accounts {
+		if ma.Account != nil {
+			if ma.Account.Email != "" {
+				labels[ma.Account.ID] = ma.Account.Email
+			} else {
+				labels[ma.Account.ID] = ma.Account.ID
+			}
+		}
+	}
+	return labels
+}
+
+func (m *Manager) Config() *config.Config {
+	return m.cfg
 }

@@ -23,15 +23,23 @@ func TestWebServerEndpoints(t *testing.T) {
 	srv := NewServer(cfg.Server, mgr)
 
 	// 1. Test index.html served
-	subFS, err := staticFS.ReadFile("static/index.html")
+	subFS, err := distFS.ReadFile("dist/index.html")
 	if err != nil {
-		t.Fatalf("static/index.html not embedded properly: %v", err)
+		t.Fatalf("dist/index.html not embedded properly: %v", err)
 	}
-	if !strings.Contains(string(subFS), "Cuota Codex 配额管家") {
+	if !strings.Contains(string(subFS), "Cuota Dashboard") {
 		t.Errorf("expected embedded index.html to contain title")
 	}
 
-	// 2. Test /api/status
+	// 2. Test /api/overview
+	reqOverview := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
+	wOverview := httptest.NewRecorder()
+	srv.handleOverview(wOverview, reqOverview)
+	if wOverview.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", wOverview.Code)
+	}
+
+	// 3. Test /api/status
 	reqStatus := httptest.NewRequest(http.MethodGet, "/api/status", nil)
 	wStatus := httptest.NewRecorder()
 	srv.handleStatus(wStatus, reqStatus)

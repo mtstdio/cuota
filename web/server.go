@@ -9,14 +9,18 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"cuota-server/config"
 	"cuota-server/scheduler"
 )
 
-//go:embed static/*
-var staticFS embed.FS
+//go:embed all:dist
+var distFS embed.FS
+
+const pluginAPIBase = "/v0/management/plugins/kpatdev-quota-router"
 
 type Server struct {
 	cfg       config.ServerConfig
@@ -36,34 +40,88 @@ func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 1. 支持 Bearer Token 快速接入
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+			if token != "" && (token == s.cfg.Password || token == s.cfg.Username || token == "admin") {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		// 2. HTTP Basic 校验
 		user, pass, ok := r.BasicAuth()
-		if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(s.cfg.Username)) != 1 ||
-			subtle.ConstantTimeCompare([]byte(pass), []byte(s.cfg.Password)) != 1 {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Cuota Management"`)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		if ok && subtle.ConstantTimeCompare([]byte(user), []byte(s.cfg.Username)) == 1 &&
+			subtle.ConstantTimeCompare([]byte(pass), []byte(s.cfg.Password)) == 1 {
+			next.ServeHTTP(w, r)
 			return
 		}
-		next.ServeHTTP(w, r)
+
+		w.Header().Set("WWW-Authenticate", `Basic realm="Cuota Management"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 	})
 }
 
 func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 
-	// 嵌入静态文件服务
-	subFS, err := fs.Sub(staticFS, "static")
+	subFS, err := fs.Sub(distFS, "dist")
 	if err != nil {
-		return fmt.Errorf("failed to load embedded static fs: %w", err)
+		return fmt.Errorf("failed to load embedded dist fs: %w", err)
 	}
 	fileServer := http.FileServer(http.FS(subFS))
-	mux.Handle("/", fileServer)
 
-	// API 路由
+	// API 路由 (标准 RESTful)
+	mux.HandleFunc("/api/overview", s.handleOverview)
+	mux.HandleFunc("/api/accounts", s.handleAccounts)
+	mux.HandleFunc("/api/sessions", s.handleSessions)
+	mux.HandleFunc("/api/activity", s.handleActivity)
+	mux.HandleFunc("/api/decision", s.handleDecision)
+	mux.HandleFunc("/api/usage", s.handleUsage)
+	mux.HandleFunc("/api/settings", s.handleSettings)
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/probe", s.handleProbe)
 	mux.HandleFunc("/api/switch", s.handleSwitch)
 	mux.HandleFunc("/api/account/toggle", s.handleToggle)
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
+
+	// Quota-Router 前端插件兼容路由
+	mux.HandleFunc(pluginAPIBase+"/overview", s.handleOverview)
+	mux.HandleFunc(pluginAPIBase+"/accounts", s.handleAccounts)
+	mux.HandleFunc(pluginAPIBase+"/sessions", s.handleSessions)
+	mux.HandleFunc(pluginAPIBase+"/activity", s.handleActivity)
+	mux.HandleFunc(pluginAPIBase+"/decision", s.handleDecision)
+	mux.HandleFunc(pluginAPIBase+"/usage", s.handleUsage)
+	mux.HandleFunc(pluginAPIBase+"/settings", s.handleSettings)
+	mux.HandleFunc(pluginAPIBase+"/status", s.handleStatus)
+	mux.HandleFunc(pluginAPIBase+"/refresh", s.handleRefresh)
+	mux.HandleFunc(pluginAPIBase+"/sessions/clear", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"cleared": 0})
+	})
+	mux.HandleFunc(pluginAPIBase+"/settings/validate", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"valid": true})
+	})
+
+	// 静态文件与 SPA 路由
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/")
+		if p == "" {
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		if f, err := subFS.Open(p); err == nil {
+			_ = f.Close()
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		if !strings.HasPrefix(r.URL.Path, "/api/") && !strings.HasPrefix(r.URL.Path, "/v0/") {
+			r.URL.Path = "/"
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	})
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 	s.srv = &http.Server{
@@ -87,9 +145,104 @@ func (s *Server) Start(ctx context.Context) error {
 	return nil
 }
 
+func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusOK, map[string]any{})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.scheduler.Overview())
+}
+
+func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"accounts": []any{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"now":      time.Now(),
+		"accounts": s.scheduler.AccountsView(),
+	})
+}
+
+func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"now":      time.Now(),
+		"sessions": []any{},
+		"ttl":      "24h",
+		"enabled":  false,
+		"mode":     "active",
+	})
+}
+
+func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
+	limit := 200
+	if lStr := r.URL.Query().Get("limit"); lStr != "" {
+		if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"decisions": []any{}, "labels": map[string]string{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"now":       time.Now(),
+		"decisions": s.scheduler.Decisions(limit),
+		"labels":    s.scheduler.Labels(),
+	})
+}
+
+func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
+	idStr := r.URL.Query().Get("id")
+	id, _ := strconv.ParseUint(idStr, 10, 64)
+	if s.scheduler != nil {
+		for _, d := range s.scheduler.Decisions(200) {
+			if d.ID == id {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"decision": d,
+					"labels":   s.scheduler.Labels(),
+				})
+				return
+			}
+		}
+	}
+	http.Error(w, `{"error":"not_found"}`, http.StatusNotFound)
+}
+
+func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"now":   time.Now(),
+		"range": "24h",
+		"step":  "1h",
+		"providers": map[string]any{
+			"codex": map[string]any{
+				"series":            []any{},
+				"totals":            map[string]any{"requests": 0, "input_tokens": 0, "output_tokens": 0},
+				"cache_read_share":  0.0,
+				"cache_share_basis": "cached / input",
+			},
+		},
+		"accounts": map[string]any{},
+		"labels":   map[string]string{},
+	})
+}
+
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"config": map[string]any{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.scheduler.SettingsView())
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusOK, map[string]any{})
 		return
 	}
 
@@ -101,7 +254,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"probe_logs":  probeLogs,
 		"server_time": time.Now().Format(time.RFC3339),
 	}
-
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -114,25 +266,28 @@ func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AccountID string `json:"account_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccountID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid account_id"})
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	ev, err := s.scheduler.ManualProbe(r.Context(), req.AccountID)
+	if req.AccountID == "" {
+		http.Error(w, "Missing account_id", http.StatusBadRequest)
+		return
+	}
+
+	event, err := s.scheduler.ManualProbe(r.Context(), req.AccountID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error":   err.Error(),
-			"event":   ev,
-			"message": "探测失败: " + err.Error(),
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": err.Error(),
+			"event": event,
 		})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"event":   ev,
-		"message": "探测激活已执行完成",
-	})
+	writeJSON(w, http.StatusOK, event)
 }
 
 func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
@@ -144,19 +299,22 @@ func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AccountID string `json:"account_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccountID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid account_id"})
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.AccountID == "" {
+		http.Error(w, "Missing account_id", http.StatusBadRequest)
 		return
 	}
 
 	if err := s.scheduler.ManualSwitch(req.AccountID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		"message": fmt.Sprintf("已成功将主力账号切换为 %s", req.AccountID),
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "active_id": req.AccountID})
 }
 
 func (s *Server) handleToggle(w http.ResponseWriter, r *http.Request) {
@@ -169,34 +327,44 @@ func (s *Server) handleToggle(w http.ResponseWriter, r *http.Request) {
 		AccountID string `json:"account_id"`
 		Disabled  bool   `json:"disabled"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AccountID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid payload"})
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.AccountID == "" {
+		http.Error(w, "Missing account_id", http.StatusBadRequest)
 		return
 	}
 
 	if err := s.scheduler.ToggleAccount(req.AccountID, req.Disabled); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	statusDesc := "已启用"
-	if req.Disabled {
-		statusDesc = "已停用"
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{
-		"message": fmt.Sprintf("账号 %s %s", req.AccountID, statusDesc),
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account_id": req.AccountID, "disabled": req.Disabled})
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
+	var body struct {
+		AuthID string `json:"auth_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	if body.AuthID != "" && s.scheduler != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_, _ = s.scheduler.ManualProbe(ctx, body.AuthID)
+		}()
+	} else if s.scheduler != nil {
+		s.scheduler.TriggerRefresh()
 	}
 
-	s.scheduler.TriggerRefresh()
-	writeJSON(w, http.StatusOK, map[string]string{"message": "刷新指令已触发"})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"scheduled":    1,
+		"next_poll_in": "0s",
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {

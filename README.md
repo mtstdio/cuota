@@ -21,10 +21,15 @@ Cuota Server 是面向 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIP
   - 优先读取挂载的本地 `auth-dir`（例如 `~/.cli-proxy-api`）中的 JSON 凭据，直接更新状态并触发写盘。
   - 自动调用 CPA Management API（`/v0/management/auth-files`）热重载生效，兼容本地部署与 Docker 容器化编排。
 
-- 📊 **内置轻量 Web 看板与 RESTful API**
-  - 单文件二进制集成（基于 Go `embed.FS` 嵌入响应式前端，无外部静态资源依赖）。
-  - 实时展示多账号 5h 剩余百分比、5h 重置倒计时、周额度进度条、当前主力账号与冷却队列。
-  - 支持一键手动发送 Probe 探测、一键切换主账号、手动启停账号。
+- 📊 **现代化多 Tab Web 看板与决策审计（参考 Quota-Router）**
+  - **单文件二进制内嵌**：基于 Go `embed.FS` 嵌入现代化 React 19 + TypeScript SPA，无外部静态 CDN 依赖。
+  - **五大核心 Tab 视图**：
+    - **Overview（概览）**：主力账号卡片、5h 倒计时、就绪与冷却统计、全局刷新。
+    - **Accounts（账号管理）**：5h 与周配额双进度条、账号侧滑抽屉详情、一键手动 Probe 探测激活、一键切换主力。
+    - **Sessions（会话追踪）**：会话亲和与绑定状态展示。
+    - **Activity（决策流水）**：完整记录 5h 滑动漂移检测、Probe 激活、主力耗尽熔断等调度决策流水。
+    - **Settings（配置中心）**：轮询周期、耗尽阈值、探测模型可视化展示与管理。
+  - **双重 API 兼容**：同时支持标准 `/api/*` RESTful 接口与 Quota-Router 插件管理接口。
 
 ---
 
