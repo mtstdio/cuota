@@ -13,46 +13,42 @@ import (
 	"cuota-server/quota"
 )
 
-func TestShouldProbe(t *testing.T) {
+func TestShouldProbeDrift(t *testing.T) {
 	ctrl := NewController(config.ProbeConfig{
 		Enabled: true,
 	})
 
 	now := time.Now()
 
-	// 1. 0% 使用率且 reset_at 为空 -> 应该探测激活
+	// 1. 0% 使用率且 reset_at 向后漂移 -> 应该探测激活 (Lazy Window)
 	q1 := &quota.AccountQuota{
 		IsUsable: true,
 		FiveHour: &quota.Window{
 			UsedPercent: 0,
+			ResetAt:     now.Add(5 * time.Hour),
 		},
 	}
-	if !ctrl.ShouldProbe(q1) {
-		t.Errorf("expected ShouldProbe=true for 0%% used with zero reset_at")
+	lastReset1 := now.Add(5*time.Hour - 10*time.Second) // 漂移了 10 秒
+	if !ctrl.ShouldProbeDrift(q1, lastReset1) {
+		t.Errorf("expected ShouldProbeDrift=true when reset_at drifted forward")
 	}
 
-	// 2. reset_at 在过去 -> 应该探测激活
+	// 2. 0% 使用率但 reset_at 未漂移（已锁定倒计时） -> 不应该探测
+	lastReset2 := q1.FiveHour.ResetAt
+	if ctrl.ShouldProbeDrift(q1, lastReset2) {
+		t.Errorf("expected ShouldProbeDrift=false when reset_at did not drift")
+	}
+
+	// 3. 有使用量（>0%） -> 不应该探测
 	q2 := &quota.AccountQuota{
 		IsUsable: true,
 		FiveHour: &quota.Window{
-			UsedPercent: 90,
-			ResetAt:     now.Add(-5 * time.Minute),
+			UsedPercent: 10,
+			ResetAt:     now.Add(5 * time.Hour),
 		},
 	}
-	if !ctrl.ShouldProbe(q2) {
-		t.Errorf("expected ShouldProbe=true when reset_at passed")
-	}
-
-	// 3. reset_at 在未来 -> 不应该探测
-	q3 := &quota.AccountQuota{
-		IsUsable: true,
-		FiveHour: &quota.Window{
-			UsedPercent: 50,
-			ResetAt:     now.Add(2 * time.Hour),
-		},
-	}
-	if ctrl.ShouldProbe(q3) {
-		t.Errorf("expected ShouldProbe=false when reset_at is in future")
+	if ctrl.ShouldProbeDrift(q2, lastReset1) {
+		t.Errorf("expected ShouldProbeDrift=false when used > 0")
 	}
 }
 

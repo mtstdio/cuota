@@ -25,11 +25,14 @@ const (
 )
 
 type ManagedAccount struct {
-	Account   *cpa.Account        `json:"account"`
-	Quota     *quota.AccountQuota `json:"quota,omitempty"`
-	State     AccountState        `json:"state"`
-	StateDesc string              `json:"state_desc"`
-	LastSeen  time.Time           `json:"last_seen"`
+	Account       *cpa.Account        `json:"account"`
+	Quota         *quota.AccountQuota `json:"quota,omitempty"`
+	State         AccountState        `json:"state"`
+	StateDesc     string              `json:"state_desc"`
+	LastSeen      time.Time           `json:"last_seen"`
+	LastResetAt   time.Time           `json:"last_reset_at,omitempty"`
+	LockedResetAt time.Time           `json:"locked_reset_at,omitempty"`
+	LastProbeAt   time.Time           `json:"last_probe_at,omitempty"`
 }
 
 type Manager struct {
@@ -143,21 +146,28 @@ func (m *Manager) reconcileSingleAccount(ctx context.Context, acct *cpa.Account)
 
 	now := time.Now()
 
-	// 检查 5h 自动激活条件（Probe ping）
-	if m.prober.ShouldProbe(q) {
-		log.Printf("[Scheduler] Account %s meets 5h reset probe condition, triggering activation...", acct.ID)
-		_, probeErr := m.prober.Execute(ctx, acct)
-		if probeErr == nil {
-			// 激活成功后，重新获取一次额度以确认倒计时和配额已经启动
-			time.Sleep(1 * time.Second)
-			freshQ, _ := m.fetcher.Fetch(acct)
-			m.mu.Lock()
-			if freshQ != nil {
-				managed.Quota = freshQ
-				q = freshQ
-			}
-			m.mu.Unlock()
+	// 1. 冷却到期直接激活 (Cooldown Expiration Immediate Probe)
+	if managed.State == StateCooldown && !managed.LockedResetAt.IsZero() && now.After(managed.LockedResetAt) && q.FiveHour != nil && q.FiveHour.UsedPercent == 0 {
+		log.Printf("[Scheduler] Account %s reached cooldown reset time with 0%% usage, triggering probe...", acct.ID)
+		m.executeProbeAndRefresh(ctx, acct, managed)
+		return
+	}
+
+	// 2. 连续两轮比对重置漂移（Drift Detection for Lazy Window）
+	if q.FiveHour != nil && q.FiveHour.UsedPercent == 0 && !managed.LastResetAt.IsZero() {
+		drift := q.FiveHour.ResetAt.Sub(managed.LastResetAt)
+		if drift >= 3*time.Second {
+			log.Printf("[Scheduler] Account %s detected reset drift (+%v), lazy window confirmed, triggering probe...", acct.ID, drift)
+			m.executeProbeAndRefresh(ctx, acct, managed)
+			return
 		}
+	}
+
+	// 记录本次观测到的 ResetAt（供下轮漂移比对）
+	if q.FiveHour != nil {
+		m.mu.Lock()
+		managed.LastResetAt = q.FiveHour.ResetAt
+		m.mu.Unlock()
 	}
 
 	// 判断是否耗尽进入 Cooldown
@@ -173,6 +183,9 @@ func (m *Manager) reconcileSingleAccount(ctx context.Context, acct *cpa.Account)
 			if !q.FiveHour.ResetAt.IsZero() && q.FiveHour.ResetAt.After(now) {
 				countdown := q.FiveHour.ResetAt.Sub(now).Round(time.Minute)
 				desc += fmt.Sprintf("，预计 %s 后重置", countdown)
+				m.mu.Lock()
+				managed.LockedResetAt = q.FiveHour.ResetAt
+				m.mu.Unlock()
 			}
 			m.setAccountState(acct.ID, StateCooldown, desc)
 			return
@@ -306,6 +319,31 @@ func (m *Manager) ManualSwitch(accountID string) error {
 	return m.cpaClient.UpdateAccountStatus(accountID, false, 100)
 }
 
+func (m *Manager) executeProbeAndRefresh(ctx context.Context, acct *cpa.Account, managed *ManagedAccount) {
+	ev, probeErr := m.prober.Execute(ctx, acct)
+	if probeErr == nil && ev.Success {
+		m.mu.Lock()
+		managed.LastProbeAt = time.Now()
+		m.mu.Unlock()
+
+		// 等待 2 秒让 OpenAI 配额后端刷新
+		time.Sleep(2 * time.Second)
+		freshQ, fetchErr := m.fetcher.Fetch(acct)
+		if fetchErr == nil && freshQ != nil {
+			m.mu.Lock()
+			managed.Quota = freshQ
+			if freshQ.FiveHour != nil {
+				managed.LastResetAt = freshQ.FiveHour.ResetAt
+				managed.LockedResetAt = time.Time{} // 解除冷却锁定
+			}
+			m.mu.Unlock()
+		}
+		if managed.State == StateCooldown {
+			m.setAccountState(acct.ID, StateReady, "5h 额度已激活恢复，就绪待命")
+		}
+	}
+}
+
 func (m *Manager) ManualProbe(ctx context.Context, accountID string) (*probe.Event, error) {
 	m.mu.RLock()
 	ma, ok := m.accounts[accountID]
@@ -315,7 +353,25 @@ func (m *Manager) ManualProbe(ctx context.Context, accountID string) (*probe.Eve
 	}
 
 	ev, err := m.prober.Execute(ctx, ma.Account)
-	if err == nil {
+	if err == nil && ev.Success {
+		m.mu.Lock()
+		ma.LastProbeAt = time.Now()
+		m.mu.Unlock()
+
+		time.Sleep(2 * time.Second)
+		freshQ, fetchErr := m.fetcher.Fetch(ma.Account)
+		if fetchErr == nil && freshQ != nil {
+			m.mu.Lock()
+			ma.Quota = freshQ
+			if freshQ.FiveHour != nil {
+				ma.LastResetAt = freshQ.FiveHour.ResetAt
+				ma.LockedResetAt = time.Time{}
+			}
+			m.mu.Unlock()
+		}
+		if ma.State == StateCooldown {
+			m.setAccountState(accountID, StateReady, "5h 额度已激活恢复，就绪待命")
+		}
 		m.TriggerRefresh()
 	}
 	return ev, err

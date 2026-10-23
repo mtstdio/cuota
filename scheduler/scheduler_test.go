@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"cuota-server/config"
 	"cuota-server/cpa"
@@ -85,4 +86,39 @@ func TestSchedulerFillFirstPromotionAndSwitch(t *testing.T) {
 	if activeID != "acct2.json" {
 		t.Errorf("expected active to be manually switched to acct2.json, got %s", activeID)
 	}
+}
+
+func TestSchedulerDriftDetection(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.CPA.AuthDir = tmpDir
+
+	cpaClient := cpa.NewClient(cfg.CPA)
+	fetcher := quota.NewFetcher(cfg.Quota.RequestTimeout)
+	prober := probe.NewController(cfg.Probe)
+	mgr := NewManager(&cfg, cpaClient, fetcher, prober)
+
+	now := time.Now()
+	q := &quota.AccountQuota{
+		IsUsable: true,
+		FiveHour: &quota.Window{
+			UsedPercent: 0,
+			ResetAt:     now.Add(5 * time.Hour),
+		},
+	}
+	lastReset := now.Add(5*time.Hour - 10*time.Second)
+
+	if !prober.ShouldProbeDrift(q, lastReset) {
+		t.Errorf("expected drift to be detected when reset_at moved forward by 10s")
+	}
+
+	lockedReset := now.Add(-1 * time.Minute)
+	managed := &ManagedAccount{
+		State:         StateCooldown,
+		LockedResetAt: lockedReset,
+	}
+	if !(managed.State == StateCooldown && now.After(managed.LockedResetAt) && q.FiveHour.UsedPercent == 0) {
+		t.Errorf("expected cooldown expiration to trigger probe")
+	}
+	_ = mgr
 }

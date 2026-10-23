@@ -50,23 +50,30 @@ func NewController(cfg config.ProbeConfig) *Controller {
 	}
 }
 
-func (c *Controller) ShouldProbe(q *quota.AccountQuota) bool {
-	if !c.cfg.Enabled || q == nil || !q.IsUsable {
+func (c *Controller) ShouldProbeDrift(q *quota.AccountQuota, lastResetAt time.Time) bool {
+	if !c.cfg.Enabled || q == nil || !q.IsUsable || q.FiveHour == nil {
 		return false
 	}
-	if q.FiveHour == nil {
+
+	// 使用率为 0，且上次观测的 ResetAt 存在，且当前 ResetAt 发生了向后漂移（说明倒计时未锁定）
+	if q.FiveHour.UsedPercent == 0 && !lastResetAt.IsZero() {
+		if q.FiveHour.ResetAt.Sub(lastResetAt) >= 3*time.Second {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (c *Controller) ShouldProbe(q *quota.AccountQuota) bool {
+	if !c.cfg.Enabled || q == nil || !q.IsUsable || q.FiveHour == nil {
 		return false
 	}
 
 	now := time.Now()
 
-	// 1. 如果 reset_at 已经过去，说明 5h 周期结束需要触发激活
+	// reset_at 已经过去，说明 5h 周期结束需要触发激活
 	if !q.FiveHour.ResetAt.IsZero() && now.After(q.FiveHour.ResetAt) {
-		return true
-	}
-
-	// 2. 如果 5h 额度使用率为 0，且没有重置倒计时或倒计时未生效，触发激活启动倒计时
-	if q.FiveHour.UsedPercent == 0 && q.FiveHour.ResetAt.IsZero() {
 		return true
 	}
 
@@ -119,7 +126,7 @@ func (c *Controller) Execute(ctx context.Context, account *cpa.Account) (*Event,
 				},
 			},
 		},
-		"stream": true,
+		"stream": false,
 		"store":  false,
 	}
 
@@ -142,7 +149,7 @@ func (c *Controller) Execute(ctx context.Context, account *cpa.Account) (*Event,
 	req.Header.Set("Authorization", "Bearer "+account.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal")
-	req.Header.Set("Accept", "text/event-stream, application/json")
+	req.Header.Set("Accept", "application/json")
 	if account.ChatGPTAccountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", account.ChatGPTAccountID)
 	}
@@ -161,23 +168,58 @@ func (c *Controller) Execute(ctx context.Context, account *cpa.Account) (*Event,
 
 	event.Status = resp.StatusCode
 
-	// 消费部分响应体
-	buf := make([]byte, 2048)
-	n, _ := io.ReadAtLeast(resp.Body, buf, 1)
-	bodySample := string(buf[:n])
+	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		event.Success = true
-		event.Message = fmt.Sprintf("5h window activated successfully (status %d)", resp.StatusCode)
-		log.Printf("[Probe] Account %s activated successfully in %v!", account.ID, event.Duration)
+		tokens, hasTokens := parseUsageTokens(body)
+		if hasTokens {
+			event.Success = true
+			event.Message = fmt.Sprintf("5h 额度激活成功，实际消耗 %d tokens", tokens)
+			log.Printf("[Probe] Account %s activated successfully in %v (tokens: %d)!", account.ID, event.Duration, tokens)
+		} else {
+			event.Success = true
+			event.Message = fmt.Sprintf("5h 探活响应成功 (status %d)", resp.StatusCode)
+			log.Printf("[Probe] Account %s probe returned status %d in %v!", account.ID, resp.StatusCode, event.Duration)
+		}
 	} else {
 		event.Success = false
-		event.Message = fmt.Sprintf("probe rejected with status %d: %s", resp.StatusCode, bodySample)
-		log.Printf("[Probe] Account %s probe failed with status %d: %s", account.ID, resp.StatusCode, bodySample)
+		event.Message = fmt.Sprintf("probe rejected with status %d: %s", resp.StatusCode, string(body))
+		log.Printf("[Probe] Account %s probe failed with status %d: %s", account.ID, resp.StatusCode, string(body))
 	}
 
 	c.recordEvent(*event)
 	return event, nil
+}
+
+func parseUsageTokens(body []byte) (int, bool) {
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return 0, false
+	}
+	paths := [][]string{
+		{"usage", "total_tokens"},
+		{"usage", "input_tokens"},
+		{"response", "usage", "total_tokens"},
+		{"response", "usage", "input_tokens"},
+	}
+	for _, path := range paths {
+		var cur any = doc
+		ok := true
+		for _, key := range path {
+			m, isMap := cur.(map[string]any)
+			if !isMap {
+				ok = false
+				break
+			}
+			cur = m[key]
+		}
+		if ok {
+			if v, isFloat := cur.(float64); isFloat && v > 0 {
+				return int(v), true
+			}
+		}
+	}
+	return 0, false
 }
 
 func (c *Controller) recordEvent(ev Event) {
