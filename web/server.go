@@ -103,6 +103,12 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc(pluginAPIBase+"/settings/validate", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"valid": true})
 	})
+	mux.HandleFunc(pluginAPIBase+"/config", s.handleConfig)
+	mux.HandleFunc(pluginAPIBase+"/export", s.handleExport)
+	mux.HandleFunc(pluginAPIBase+"/simulate", s.handleSimulate)
+	mux.HandleFunc("/api/config", s.handleConfig)
+	mux.HandleFunc("/api/export", s.handleExport)
+	mux.HandleFunc("/api/simulate", s.handleSimulate)
 
 	// 静态文件与 SPA 路由
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -380,6 +386,64 @@ func (s *Server) handleToggle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account_id": req.AccountID, "disabled": req.Disabled})
+}
+
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPatch || r.Method == http.MethodPost {
+		var patch map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&patch)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"valid":      true,
+			"generation": "1",
+			"changes":    []any{},
+		})
+		return
+	}
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+}
+
+func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{
+		"status": "ok",
+		"now":    time.Now(),
+	}
+	if s.scheduler != nil {
+		out["overview"] = s.scheduler.Overview()
+		out["settings"] = s.scheduler.SettingsView()
+		out["decisions"] = s.scheduler.Decisions(100)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleSimulate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var nextUp []any
+	var labels map[string]string
+	if s.scheduler != nil {
+		ov := s.scheduler.Overview()
+		if nu, ok := ov["next_up"].([]map[string]any); ok {
+			for _, item := range nu {
+				nextUp = append(nextUp, item)
+			}
+		}
+		labels = s.scheduler.Labels()
+	}
+	if nextUp == nil {
+		nextUp = []any{}
+	}
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"current_policy": "fill_first",
+		"mode":           "active",
+		"results":        nextUp,
+		"recent":         []any{},
+		"labels":         labels,
+	})
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {

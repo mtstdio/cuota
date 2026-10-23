@@ -135,8 +135,8 @@ function Shell({ theme, toggleTheme }: { theme: "dark" | "light"; toggleTheme: (
   }, [meta.label]);
 
   const groups = [...new Set(routes.map((r) => r.group))];
-  const sessions = ov ? ov.summary.claude.active_sessions + ov.summary.codex.active_sessions : undefined;
-  const healthy = ov && !ov.plugin.worker_failed && ov.plugin.worker_running && ov.roster.ok;
+  const sessions = ov?.summary ? (ov.summary.claude?.active_sessions ?? 0) + (ov.summary.codex?.active_sessions ?? 0) : undefined;
+  const healthy = ov ? (!ov.plugin?.worker_failed && ov.plugin?.worker_running && ov.roster?.ok) : false;
 
   return (
     <div className={`shell ${navOpen ? "nav-open" : ""}`}>
@@ -145,7 +145,7 @@ function Shell({ theme, toggleTheme }: { theme: "dark" | "light"; toggleTheme: (
           <span className="brand-mark"><Logo /></span>
           <div>
             <div className="brand-name">Quota Router</div>
-            <div className="brand-sub">CLIProxyAPI plugin{ov ? ` · v${ov.plugin.version}` : ""}</div>
+            <div className="brand-sub">CLIProxyAPI plugin{ov?.plugin ? ` · v${ov.plugin.version}` : ""}</div>
           </div>
         </div>
         {groups.map((g) => (
@@ -156,7 +156,7 @@ function Shell({ theme, toggleTheme }: { theme: "dark" | "light"; toggleTheme: (
                 <r.icon />
                 {r.label}
                 {r.id === "sessions" && sessions !== undefined && <span className="nav-badge num">{sessions}</span>}
-                {r.id === "accounts" && ov && <span className="nav-badge num">{ov.summary.claude.total + ov.summary.codex.total}</span>}
+                {r.id === "accounts" && ov?.summary && <span className="nav-badge num">{(ov.summary.claude?.total ?? 0) + (ov.summary.codex?.total ?? 0)}</span>}
               </a>
             ))}
           </div>

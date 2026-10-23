@@ -827,6 +827,71 @@ func (m *Manager) SettingsView() map[string]any {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	schema := []map[string]any{
+		{
+			"name":        "strategy",
+			"type":        "enum",
+			"enum":        []string{"fill_first", "reset_first", "quota_pressure", "balanced"},
+			"default":     "fill_first",
+			"group":       "Routing",
+			"description": "How accounts are prioritized (fill_first, reset_first, etc.)",
+			"effect":      "Affects primary active account selection.",
+		},
+		{
+			"name":        "mode",
+			"type":        "enum",
+			"enum":        []string{"active", "shadow"},
+			"default":     "active",
+			"group":       "Routing",
+			"description": "Active routes and promotes accounts. Shadow records proposed decisions.",
+			"effect":      "Immediate.",
+		},
+		{
+			"name":        "poll_interval",
+			"type":        "duration",
+			"min":         "10s",
+			"max":         "1h",
+			"default":     "1m",
+			"group":       "Quota",
+			"description": "Interval between quota polling cycles.",
+			"effect":      "Applied on next cycle.",
+		},
+		{
+			"name":        "min_remaining_percent",
+			"type":        "number",
+			"min":         "0",
+			"max":         "50",
+			"default":     2,
+			"group":       "Quota",
+			"description": "Minimum 5h quota remaining percent before switching account.",
+			"effect":      "Applied on next quota check.",
+		},
+		{
+			"name":        "probe_enabled",
+			"type":        "boolean",
+			"default":     true,
+			"group":       "Diagnostics",
+			"description": "Automatically send minimal ping probe to lock 5h reset countdown.",
+			"effect":      "Controls background probe trigger.",
+		},
+		{
+			"name":        "probe_model",
+			"type":        "string",
+			"default":     "gpt-5.6-luna",
+			"group":       "Diagnostics",
+			"description": "Model used for 5h activation probes.",
+			"effect":      "Applied on next probe.",
+		},
+		{
+			"name":        "auth_dir",
+			"type":        "string",
+			"default":     m.cfg.CPA.AuthDir,
+			"group":       "Storage",
+			"description": "Directory where CLIProxyAPI auth json files are located.",
+			"effect":      "Account directory scanning.",
+		},
+	}
+
 	return map[string]any{
 		"config": map[string]any{
 			"mode":                  "active",
@@ -839,7 +904,7 @@ func (m *Manager) SettingsView() map[string]any {
 			"cpa_base_url":          m.cfg.CPA.BaseURL,
 			"auth_dir":              m.cfg.CPA.AuthDir,
 		},
-		"schema":     []any{},
+		"schema":     schema,
 		"generation": "1",
 		"patch_path": "/v0/management/plugins/kpatdev-quota-router/config",
 	}

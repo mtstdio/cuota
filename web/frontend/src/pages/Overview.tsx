@@ -43,7 +43,7 @@ export function OverviewPage({ overview, reloadOverview, provider, search, now }
       </section>
       {providers.map((p) => {
         const list = accounts.filter((a) => a.provider === p);
-        const s = ov.summary[p];
+        const s = ov.summary?.[p] ?? { total: 0, eligible: 0, limited: 0, unknown: 0, exhausted: 0, blocked: 0, expiring_soon: 0, active_sessions: 0 };
         return (
           <section className="panel" key={p} aria-labelledby={`group-${p}`}>
             <div className="group-head">
@@ -76,10 +76,10 @@ export function OverviewPage({ overview, reloadOverview, provider, search, now }
 
 function Stats({ ov, now }: { ov: Overview; now: number }) {
   const next = ov.upcoming?.[0];
-  const sessions = ov.summary.claude.active_sessions + ov.summary.codex.active_sessions;
-  const healthy = !ov.plugin.worker_failed && ov.plugin.worker_running && ov.roster.ok;
+  const sessions = (ov.summary?.claude?.active_sessions ?? 0) + (ov.summary?.codex?.active_sessions ?? 0);
+  const healthy = !ov.plugin?.worker_failed && ov.plugin?.worker_running && ov.roster?.ok;
   const tile = (p: Provider) => {
-    const s = ov.summary[p];
+    const s = ov.summary?.[p] ?? { total: 0, eligible: 0, exhausted: 0, blocked: 0, limited: 0, unknown: 0, expiring_soon: 0, active_sessions: 0 };
     return (
       <div className="stat">
         <div className="stat-label"><ProviderMark provider={p} />{providerName(p)} accounts</div>
@@ -98,7 +98,7 @@ function Stats({ ov, now }: { ov: Overview; now: number }) {
       <div className="stat">
         <div className="stat-label">Active sessions</div>
         <div className="stat-value">{sessions}<small>bound</small></div>
-        <div className="stat-foot">Claude {ov.summary.claude.active_sessions} · Codex {ov.summary.codex.active_sessions}</div>
+        <div className="stat-foot">Claude {ov.summary?.claude?.active_sessions ?? 0} · Codex {ov.summary?.codex?.active_sessions ?? 0}</div>
       </div>
       <div className="stat">
         <div className="stat-label">Next reset</div>
