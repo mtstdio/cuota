@@ -13,6 +13,7 @@ import (
 	"cuota-server/probe"
 	"cuota-server/quota"
 	"cuota-server/scheduler"
+	"cuota-server/store"
 	"cuota-server/web"
 )
 
@@ -33,10 +34,15 @@ func main() {
 	defer cancel()
 
 	// 初始化各核心子系统
+	st, err := store.NewStore(cfg.Storage.StatePath)
+	if err != nil {
+		log.Printf("[Main] 警告: 初始化存储失败 (%v)，降级为内存运行", err)
+	}
+
 	cpaClient := cpa.NewClient(cfg.CPA)
 	quotaFetcher := quota.NewFetcher(cfg.Quota.RequestTimeout)
 	probeController := probe.NewController(cfg.Probe)
-	schedulerManager := scheduler.NewManager(cfg, cpaClient, quotaFetcher, probeController)
+	schedulerManager := scheduler.NewManager(cfg, cpaClient, quotaFetcher, probeController, st)
 	webServer := web.NewServer(cfg.Server, schedulerManager)
 
 	// 启动后台调度与配额管理引擎

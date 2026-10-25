@@ -15,6 +15,7 @@ type Config struct {
 	Quota     QuotaConfig     `yaml:"quota"`
 	Probe     ProbeConfig     `yaml:"probe"`
 	Scheduler SchedulerConfig `yaml:"scheduler"`
+	Storage   StorageConfig   `yaml:"storage"`
 }
 
 type ServerConfig struct {
@@ -49,6 +50,10 @@ type SchedulerConfig struct {
 	Strategy string `yaml:"strategy"`
 }
 
+type StorageConfig struct {
+	StatePath string `yaml:"state_path"`
+}
+
 func DefaultConfig() Config {
 	return Config{
 		Server: ServerConfig{
@@ -76,6 +81,9 @@ func DefaultConfig() Config {
 		},
 		Scheduler: SchedulerConfig{
 			Strategy: "fill_first",
+		},
+		Storage: StorageConfig{
+			StatePath: "data/state.json",
 		},
 	}
 }
@@ -133,4 +141,11 @@ func applyEnvOverrides(cfg *Config) {
 		}
 	}
 	cfg.Server.BasePath = CleanBasePath(cfg.Server.BasePath)
+
+	for _, envKey := range []string{"STATE_PATH", "CUOTA_STATE_PATH"} {
+		if val := strings.TrimSpace(os.Getenv(envKey)); val != "" {
+			cfg.Storage.StatePath = val
+			break
+		}
+	}
 }

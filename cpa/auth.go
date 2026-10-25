@@ -33,7 +33,12 @@ func ParseAccountJSON(filename string, raw []byte) (*Account, error) {
 
 	provider, _ := doc["provider"].(string)
 	if provider == "" {
-		if _, ok := doc["chatgpt_account_id"]; ok {
+		lowerName := strings.ToLower(filename)
+		if strings.HasPrefix(lowerName, "claude-") {
+			provider = "claude"
+		} else if strings.HasPrefix(lowerName, "codex-") {
+			provider = "codex"
+		} else if _, ok := doc["chatgpt_account_id"]; ok {
 			provider = "codex"
 		} else if _, ok := doc["account_id"]; ok {
 			provider = "codex"

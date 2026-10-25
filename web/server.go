@@ -389,17 +389,97 @@ func (s *Server) handleToggle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPatch || r.Method == http.MethodPost {
-		var patch map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&patch)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"valid":      true,
-			"generation": "1",
-			"changes":    []any{},
-		})
+	if r.Method != http.MethodPatch && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+
+	var patch map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil || patch == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"valid": true, "generation": "1", "changes": []any{}})
+		return
+	}
+
+	var changes []map[string]any
+
+	if s.scheduler != nil {
+		// 1. strategy
+		if strat, ok := patch["strategy"].(string); ok && strat != "" {
+			oldStrat := s.scheduler.Config().Scheduler.Strategy
+			if oldStrat != strat {
+				_ = s.scheduler.SetStrategy(strat)
+				changes = append(changes, map[string]any{
+					"field":  "strategy",
+					"from":   oldStrat,
+					"to":     strat,
+					"effect": "Immediate",
+				})
+			}
+		}
+
+		// 2. account_alias / account_aliases
+		var rawAliases any
+		if v, ok := patch["account_alias"]; ok {
+			rawAliases = v
+		} else if v, ok := patch["account_aliases"]; ok {
+			rawAliases = v
+		}
+		if rawAliases != nil {
+			if m, ok := rawAliases.(map[string]any); ok {
+				aliases := make(map[string]string)
+				for k, v := range m {
+					if str, ok := v.(string); ok {
+						aliases[k] = str
+					}
+				}
+				s.scheduler.SetAccountAliases(aliases)
+				changes = append(changes, map[string]any{
+					"field":  "account_alias",
+					"to":     aliases,
+					"effect": "Immediate",
+				})
+			}
+		}
+
+		// 3. account_priority
+		if rawPrios, ok := patch["account_priority"]; ok {
+			if m, ok := rawPrios.(map[string]any); ok {
+				prios := make(map[string]int)
+				for k, v := range m {
+					if num, ok := v.(float64); ok {
+						prios[k] = int(num)
+					}
+				}
+				s.scheduler.SetAccountPriorities(prios)
+				changes = append(changes, map[string]any{
+					"field":  "account_priority",
+					"to":     prios,
+					"effect": "Immediate",
+				})
+			}
+		}
+
+		// 4. min_remaining_percent
+		if minRem, ok := patch["min_remaining_percent"].(float64); ok {
+			s.scheduler.Config().Quota.MinRemainingPercent = minRem
+		}
+
+		// 5. probe_enabled
+		if pe, ok := patch["probe_enabled"].(bool); ok {
+			s.scheduler.Config().Probe.Enabled = pe
+		}
+
+		// 6. probe_model
+		if pm, ok := patch["probe_model"].(string); ok && pm != "" {
+			s.scheduler.Config().Probe.Model = pm
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"valid":      true,
+		"generation": "1",
+		"changes":    changes,
+	})
 }
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
@@ -420,28 +500,41 @@ func (s *Server) handleSimulate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var nextUp []any
-	var labels map[string]string
-	if s.scheduler != nil {
-		ov := s.scheduler.Overview()
-		if nu, ok := ov["next_up"].([]map[string]any); ok {
-			for _, item := range nu {
-				nextUp = append(nextUp, item)
-			}
-		}
-		labels = s.scheduler.Labels()
+
+	var req struct {
+		Provider   string   `json:"provider"`
+		Model      string   `json:"model"`
+		Strategies []string `json:"strategies"`
 	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	var nextUp []map[string]any
+	var labels map[string]string
+	var recent []scheduler.DecisionView
+	currentPolicy := "fill_first"
+
+	if s.scheduler != nil {
+		currentPolicy = s.scheduler.Config().Scheduler.Strategy
+		nextUp = s.scheduler.Simulate(req.Provider, req.Model, req.Strategies)
+		labels = s.scheduler.Labels()
+		recent = s.scheduler.Decisions(20)
+	}
+
 	if nextUp == nil {
-		nextUp = []any{}
+		nextUp = []map[string]any{}
 	}
 	if labels == nil {
 		labels = map[string]string{}
 	}
+	if recent == nil {
+		recent = []scheduler.DecisionView{}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"current_policy": "fill_first",
+		"current_policy": currentPolicy,
 		"mode":           "active",
 		"results":        nextUp,
-		"recent":         []any{},
+		"recent":         recent,
 		"labels":         labels,
 	})
 }

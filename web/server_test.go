@@ -187,3 +187,48 @@ func TestBasePathRouting(t *testing.T) {
 		t.Errorf("expected 200, got %d", w5.Code)
 	}
 }
+
+func TestConfigPatchAndSimulate(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cpaClient := cpa.NewClient(cfg.CPA)
+	fetcher := quota.NewFetcher(cfg.Quota.RequestTimeout)
+	prober := probe.NewController(cfg.Probe)
+	mgr := scheduler.NewManager(&cfg, cpaClient, fetcher, prober)
+	srv := NewServer(cfg.Server, mgr)
+
+	// 1. PATCH /api/config with strategy, account_alias, account_priority
+	patchBody := `{"strategy":"reset_first","account_alias":{"test-id":"主力账号"},"account_priority":{"test-id":88}}`
+	reqPatch := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(patchBody))
+	wPatch := httptest.NewRecorder()
+	srv.handleConfig(wPatch, reqPatch)
+
+	if wPatch.Code != http.StatusOK {
+		t.Fatalf("expected 200 from handleConfig, got %d", wPatch.Code)
+	}
+
+	if mgr.Config().Scheduler.Strategy != "reset_first" {
+		t.Errorf("expected strategy updated to reset_first, got %s", mgr.Config().Scheduler.Strategy)
+	}
+	labels := mgr.Labels()
+	if labels["test-id"] != "主力账号" {
+		t.Errorf("expected label to be 主力账号, got %s", labels["test-id"])
+	}
+
+	// 2. POST /api/simulate
+	simBody := `{"provider":"codex","model":"gpt-5.6-luna","strategies":["reset_first","balanced"]}`
+	reqSim := httptest.NewRequest(http.MethodPost, "/api/simulate", strings.NewReader(simBody))
+	wSim := httptest.NewRecorder()
+	srv.handleSimulate(wSim, reqSim)
+
+	if wSim.Code != http.StatusOK {
+		t.Fatalf("expected 200 from handleSimulate, got %d", wSim.Code)
+	}
+
+	var simResp map[string]any
+	if err := json.Unmarshal(wSim.Body.Bytes(), &simResp); err != nil {
+		t.Fatalf("failed to decode simulate response: %v", err)
+	}
+	if simResp["current_policy"] != "reset_first" {
+		t.Errorf("expected current_policy reset_first, got %v", simResp["current_policy"])
+	}
+}

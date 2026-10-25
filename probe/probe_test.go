@@ -131,3 +131,78 @@ func TestExecuteProbeSSE(t *testing.T) {
 		t.Errorf("expected tokens message, got '%s'", ev.Message)
 	}
 }
+
+func TestProbeSuppressionAndBackoff(t *testing.T) {
+	statusToReturn := http.StatusOK
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(statusToReturn)
+		if statusToReturn == http.StatusOK {
+			_, _ = w.Write([]byte(`{"response":{"usage":{"total_tokens":5}}}`))
+		} else {
+			_, _ = w.Write([]byte(`error`))
+		}
+	}))
+	defer mockServer.Close()
+
+	ctrl := NewController(config.ProbeConfig{
+		Enabled:  true,
+		Endpoint: mockServer.URL,
+	})
+
+	acct := &cpa.Account{
+		ID:          "suppress-acct",
+		AccessToken: "dummy-token",
+	}
+
+	// 1. 首次探测成功
+	ev, err := ctrl.Execute(context.Background(), acct)
+	if err != nil || !ev.Success {
+		t.Fatalf("first probe failed: %v", err)
+	}
+
+	// 此时应进入 10m 抑制期
+	suppressed, until := ctrl.IsSuppressed(acct.ID, time.Now())
+	if !suppressed {
+		t.Errorf("expected account to be suppressed after success")
+	}
+	if until.Before(time.Now().Add(9 * time.Minute)) {
+		t.Errorf("expected suppress until ~10m from now, got %v", until)
+	}
+
+	// 2. 抑制期内自动执行应被拦截
+	_, err = ctrl.Execute(context.Background(), acct)
+	if err == nil {
+		t.Errorf("expected suppressed probe Execute to return error")
+	}
+
+	// 3. ShouldProbe / ShouldProbeDrift 应直接返回 false
+	q := &quota.AccountQuota{
+		AccountID: acct.ID,
+		IsUsable:  true,
+		FiveHour: &quota.Window{
+			UsedPercent: 0,
+			ResetAt:     time.Now().Add(-time.Minute),
+		},
+	}
+	if ctrl.ShouldProbe(q) {
+		t.Errorf("expected ShouldProbe=false while suppressed")
+	}
+	if ctrl.ShouldProbeDrift(q, time.Now().Add(-2*time.Minute)) {
+		t.Errorf("expected ShouldProbeDrift=false while suppressed")
+	}
+
+	// 4. ExecuteForced 允许绕过抑制
+	forcedEv, err := ctrl.ExecuteForced(context.Background(), acct)
+	if err != nil || !forcedEv.Success {
+		t.Errorf("ExecuteForced should succeed even during suppression: %v", err)
+	}
+
+	// 5. 模拟失败与指数退避
+	statusToReturn = http.StatusInternalServerError
+	_, _ = ctrl.ExecuteForced(context.Background(), acct) // fail 1 -> 10m
+	_, _ = ctrl.ExecuteForced(context.Background(), acct) // fail 2 -> 20m
+	_, until2 := ctrl.IsSuppressed(acct.ID, time.Now())
+	if until2.Before(time.Now().Add(18 * time.Minute)) {
+		t.Errorf("expected backoff ~20m after 2 fails, got %v", until2)
+	}
+}

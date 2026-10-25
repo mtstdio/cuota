@@ -76,3 +76,36 @@ func TestParseUsageResponseLimitReached(t *testing.T) {
 		t.Errorf("expected limit_reached to force used_percent=100.0, got %f", out.FiveHour.UsedPercent)
 	}
 }
+
+func TestParseClaudeUsageResponse(t *testing.T) {
+	now := time.Now()
+	raw := []byte(`{
+		"seven_day": {
+			"utilization": 35.5,
+			"resets_at": "2026-10-30T12:00:00Z"
+		},
+		"five_hour": {
+			"utilization": 15.0,
+			"resets_at": "2026-10-25T16:00:00Z"
+		}
+	}`)
+
+	var out AccountQuota
+	err := parseClaudeUsageResponse(raw, now, &out)
+	if err != nil {
+		t.Fatalf("parseClaudeUsageResponse error: %v", err)
+	}
+
+	if out.Weekly == nil {
+		t.Fatalf("expected Weekly window for claude, got nil")
+	}
+	if out.Weekly.UsedPercent != 35.5 {
+		t.Errorf("expected claude weekly used 35.5, got %f", out.Weekly.UsedPercent)
+	}
+	if out.FiveHour == nil {
+		t.Fatalf("expected FiveHour window for claude, got nil")
+	}
+	if out.FiveHour.UsedPercent != 15.0 {
+		t.Errorf("expected claude 5h used 15.0, got %f", out.FiveHour.UsedPercent)
+	}
+}

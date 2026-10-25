@@ -46,6 +46,10 @@ func NewFetcher(timeout time.Duration) *Fetcher {
 }
 
 func (f *Fetcher) Fetch(account *cpa.Account) (*AccountQuota, error) {
+	if account.Provider == "claude" {
+		return f.FetchClaude(account)
+	}
+
 	now := time.Now()
 	result := &AccountQuota{
 		AccountID: account.ID,

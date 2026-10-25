@@ -26,6 +26,12 @@ type Event struct {
 	Message   string        `json:"message"`
 }
 
+type AccountProbeState struct {
+	SuppressUntil    time.Time `json:"suppress_until"`
+	ConsecutiveFails int       `json:"consecutive_fails"`
+	LastAttemptAt    time.Time `json:"last_attempt_at"`
+}
+
 type Controller struct {
 	cfg        config.ProbeConfig
 	httpClient *http.Client
@@ -33,6 +39,7 @@ type Controller struct {
 	history    []Event
 	maxHistory int
 	probing    map[string]bool
+	states     map[string]*AccountProbeState
 }
 
 func NewController(cfg config.ProbeConfig) *Controller {
@@ -47,11 +54,48 @@ func NewController(cfg config.ProbeConfig) *Controller {
 		},
 		maxHistory: 100,
 		probing:    make(map[string]bool),
+		states:     make(map[string]*AccountProbeState),
+	}
+}
+
+func (c *Controller) IsSuppressed(accountID string, now time.Time) (bool, time.Time) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if st, ok := c.states[accountID]; ok {
+		if now.Before(st.SuppressUntil) {
+			return true, st.SuppressUntil
+		}
+	}
+	return false, time.Time{}
+}
+
+func (c *Controller) updateSuppressionLocked(accountID string, success bool, now time.Time) {
+	st, ok := c.states[accountID]
+	if !ok {
+		st = &AccountProbeState{}
+		c.states[accountID] = st
+	}
+	st.LastAttemptAt = now
+	if success {
+		st.ConsecutiveFails = 0
+		st.SuppressUntil = now.Add(10 * time.Minute)
+	} else {
+		st.ConsecutiveFails++
+		multiplier := 1 << (st.ConsecutiveFails - 1)
+		if multiplier > 6 {
+			multiplier = 6
+		}
+		st.SuppressUntil = now.Add(time.Duration(multiplier) * 10 * time.Minute)
 	}
 }
 
 func (c *Controller) ShouldProbeDrift(q *quota.AccountQuota, lastResetAt time.Time) bool {
 	if !c.cfg.Enabled || q == nil || !q.IsUsable || q.FiveHour == nil {
+		return false
+	}
+
+	now := time.Now()
+	if suppressed, _ := c.IsSuppressed(q.AccountID, now); suppressed {
 		return false
 	}
 
@@ -71,6 +115,9 @@ func (c *Controller) ShouldProbe(q *quota.AccountQuota) bool {
 	}
 
 	now := time.Now()
+	if suppressed, _ := c.IsSuppressed(q.AccountID, now); suppressed {
+		return false
+	}
 
 	// reset_at 已经过去，说明 5h 周期结束需要触发激活
 	if !q.FiveHour.ResetAt.IsZero() && now.After(q.FiveHour.ResetAt) {
@@ -81,6 +128,20 @@ func (c *Controller) ShouldProbe(q *quota.AccountQuota) bool {
 }
 
 func (c *Controller) Execute(ctx context.Context, account *cpa.Account) (*Event, error) {
+	return c.executeInternal(ctx, account, false)
+}
+
+func (c *Controller) ExecuteForced(ctx context.Context, account *cpa.Account) (*Event, error) {
+	return c.executeInternal(ctx, account, true)
+}
+
+func (c *Controller) executeInternal(ctx context.Context, account *cpa.Account, force bool) (*Event, error) {
+	now := time.Now()
+	if !force {
+		if suppressed, until := c.IsSuppressed(account.ID, now); suppressed {
+			return nil, fmt.Errorf("account %s probe suppressed until %s", account.ID, until.Format(time.RFC3339))
+		}
+	}
 	c.mu.Lock()
 	if c.probing[account.ID] {
 		c.mu.Unlock()
@@ -247,6 +308,8 @@ func extractTokensFromDoc(doc map[string]any) (int, bool) {
 func (c *Controller) recordEvent(ev Event) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	c.updateSuppressionLocked(ev.AccountID, ev.Success, ev.Timestamp)
 
 	c.history = append([]Event{ev}, c.history...)
 	if len(c.history) > c.maxHistory {

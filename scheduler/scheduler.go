@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
@@ -13,6 +14,7 @@ import (
 	"cuota-server/cpa"
 	"cuota-server/probe"
 	"cuota-server/quota"
+	"cuota-server/store"
 )
 
 type DecisionView struct {
@@ -60,24 +62,123 @@ type Manager struct {
 	cpaClient      *cpa.Client
 	fetcher        *quota.Fetcher
 	prober         *probe.Controller
+	store          *store.Store
 	mu             sync.RWMutex
 	accounts       map[string]*ManagedAccount
+	accountAliases map[string]string
+	accountPrios   map[string]int
+	activeAcctIDs  map[string]string
 	activeAcctID   string
 	refreshCh      chan struct{}
 	decisions      []DecisionView
 	nextDecisionID uint64
 }
 
-func NewManager(cfg *config.Config, cpaClient *cpa.Client, fetcher *quota.Fetcher, prober *probe.Controller) *Manager {
-	return &Manager{
-		cfg:       cfg,
-		cpaClient: cpaClient,
-		fetcher:   fetcher,
-		prober:    prober,
-		accounts:  make(map[string]*ManagedAccount),
-		refreshCh: make(chan struct{}, 1),
-		decisions: make([]DecisionView, 0, 200),
+func NewManager(cfg *config.Config, cpaClient *cpa.Client, fetcher *quota.Fetcher, prober *probe.Controller, st ...*store.Store) *Manager {
+	var storeInstance *store.Store
+	if len(st) > 0 {
+		storeInstance = st[0]
 	}
+
+	m := &Manager{
+		cfg:            cfg,
+		cpaClient:      cpaClient,
+		fetcher:        fetcher,
+		prober:         prober,
+		store:          storeInstance,
+		accounts:       make(map[string]*ManagedAccount),
+		accountAliases: make(map[string]string),
+		accountPrios:   make(map[string]int),
+		activeAcctIDs:  make(map[string]string),
+		refreshCh:      make(chan struct{}, 1),
+		decisions:      make([]DecisionView, 0, 200),
+	}
+
+	if storeInstance != nil {
+		if loaded, err := storeInstance.Load(); err == nil && loaded != nil {
+			if loaded.Strategy != "" {
+				m.cfg.Scheduler.Strategy = loaded.Strategy
+			}
+			if loaded.AccountAliases != nil {
+				m.accountAliases = loaded.AccountAliases
+			}
+			if loaded.AccountPriority != nil {
+				m.accountPrios = loaded.AccountPriority
+			}
+			if len(loaded.Decisions) > 0 {
+				for _, raw := range loaded.Decisions {
+					if b, err := json.Marshal(raw); err == nil {
+						var d DecisionView
+						if err := json.Unmarshal(b, &d); err == nil {
+							m.decisions = append(m.decisions, d)
+							if d.ID >= m.nextDecisionID {
+								m.nextDecisionID = d.ID
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return m
+}
+
+func (m *Manager) saveStateLocked() {
+	if m.store == nil {
+		return
+	}
+	decList := make([]any, 0, len(m.decisions))
+	for _, d := range m.decisions {
+		decList = append(decList, d)
+	}
+	aliasesCopy := make(map[string]string, len(m.accountAliases))
+	for k, v := range m.accountAliases {
+		aliasesCopy[k] = v
+	}
+	priosCopy := make(map[string]int, len(m.accountPrios))
+	for k, v := range m.accountPrios {
+		priosCopy[k] = v
+	}
+
+	st := &store.State{
+		Strategy:        m.cfg.Scheduler.Strategy,
+		AccountAliases:  aliasesCopy,
+		AccountPriority: priosCopy,
+		Decisions:       decList,
+		UpdatedAt:       time.Now(),
+	}
+	if err := m.store.Save(st); err != nil {
+		log.Printf("[Scheduler] Error saving state: %v", err)
+	}
+}
+
+func (m *Manager) SetStrategy(strategy string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cfg.Scheduler.Strategy = strategy
+	m.saveStateLocked()
+	m.TriggerRefresh()
+	return nil
+}
+
+func (m *Manager) SetAccountAliases(aliases map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, v := range aliases {
+		m.accountAliases[k] = v
+	}
+	m.saveStateLocked()
+}
+
+func (m *Manager) SetAccountPriorities(prios map[string]int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, v := range prios {
+		m.accountPrios[k] = v
+	}
+	m.saveStateLocked()
+	m.TriggerRefresh()
 }
 
 func (m *Manager) recordDecision(d DecisionView) {
@@ -107,6 +208,7 @@ func (m *Manager) recordDecisionLocked(d DecisionView) {
 	if len(m.decisions) > 200 {
 		m.decisions = m.decisions[:200]
 	}
+	m.saveStateLocked()
 }
 
 func (m *Manager) Start(ctx context.Context) {
@@ -198,42 +300,45 @@ func (m *Manager) reconcileSingleAccount(ctx context.Context, acct *cpa.Account)
 
 	now := time.Now()
 
-	// 1. 冷却到期直接激活 (Cooldown Expiration Immediate Probe)
-	if managed.State == StateCooldown && !managed.LockedResetAt.IsZero() && now.After(managed.LockedResetAt) && q.FiveHour != nil && q.FiveHour.UsedPercent == 0 {
-		log.Printf("[Scheduler] Account %s reached cooldown reset time with 0%% usage, triggering probe...", acct.ID)
-		m.recordDecision(DecisionView{
-			Provider: "codex",
-			Model:    m.cfg.Probe.Model,
-			Outcome:  "new_session",
-			Cause:    fmt.Sprintf("账号 %s 5h 冷却周期结束到达重置点，自动触发 Probe 激活", acct.ID),
-			AuthID:   acct.ID,
-		})
-		m.executeProbeAndRefresh(ctx, acct, managed)
-		return
-	}
-
-	// 2. 连续两轮比对重置漂移（Drift Detection for Lazy Window）
-	if q.FiveHour != nil && q.FiveHour.UsedPercent == 0 && !managed.LastResetAt.IsZero() {
-		drift := q.FiveHour.ResetAt.Sub(managed.LastResetAt)
-		if drift >= 3*time.Second {
-			log.Printf("[Scheduler] Account %s detected reset drift (+%v), lazy window confirmed, triggering probe...", acct.ID, drift)
+	// 探测仅针对 Codex 账号（Claude 无需也无 ChatGPT responses 探活接口）
+	if acct.Provider != "claude" {
+		// 1. 冷却到期直接激活 (Cooldown Expiration Immediate Probe)
+		if managed.State == StateCooldown && !managed.LockedResetAt.IsZero() && now.After(managed.LockedResetAt) && q.FiveHour != nil && q.FiveHour.UsedPercent == 0 {
+			log.Printf("[Scheduler] Account %s reached cooldown reset time with 0%% usage, triggering probe...", acct.ID)
 			m.recordDecision(DecisionView{
 				Provider: "codex",
 				Model:    m.cfg.Probe.Model,
 				Outcome:  "new_session",
-				Cause:    fmt.Sprintf("账号 %s 5h 倒计时未启动（重置点向后漂移 +%v），自动触发 Probe 激活", acct.ID, drift.Round(time.Second)),
+				Cause:    fmt.Sprintf("账号 %s 5h 冷却周期结束到达重置点，自动触发 Probe 激活", acct.ID),
 				AuthID:   acct.ID,
 			})
 			m.executeProbeAndRefresh(ctx, acct, managed)
 			return
 		}
-	}
 
-	// 记录本次观测到的 ResetAt（供下轮漂移比对）
-	if q.FiveHour != nil {
-		m.mu.Lock()
-		managed.LastResetAt = q.FiveHour.ResetAt
-		m.mu.Unlock()
+		// 2. 连续两轮比对重置漂移（Drift Detection for Lazy Window）
+		if q.FiveHour != nil && q.FiveHour.UsedPercent == 0 && !managed.LastResetAt.IsZero() {
+			drift := q.FiveHour.ResetAt.Sub(managed.LastResetAt)
+			if drift >= 3*time.Second {
+				log.Printf("[Scheduler] Account %s detected reset drift (+%v), lazy window confirmed, triggering probe...", acct.ID, drift)
+				m.recordDecision(DecisionView{
+					Provider: "codex",
+					Model:    m.cfg.Probe.Model,
+					Outcome:  "new_session",
+					Cause:    fmt.Sprintf("账号 %s 5h 倒计时未启动（重置点向后漂移 +%v），自动触发 Probe 激活", acct.ID, drift.Round(time.Second)),
+					AuthID:   acct.ID,
+				})
+				m.executeProbeAndRefresh(ctx, acct, managed)
+				return
+			}
+		}
+
+		// 记录本次观测到的 ResetAt（供下轮漂移比对）
+		if q.FiveHour != nil {
+			m.mu.Lock()
+			managed.LastResetAt = q.FiveHour.ResetAt
+			m.mu.Unlock()
+		}
 	}
 
 	// 判断是否耗尽进入 Cooldown
@@ -242,15 +347,25 @@ func (m *Manager) reconcileSingleAccount(ctx context.Context, acct *cpa.Account)
 		minRemaining = 2.0
 	}
 
+	// Codex 5h 窗口或 Claude 5h/7d 窗口检查
+	var checkWindow *quota.Window
+	windowName := "5h"
 	if q.FiveHour != nil {
-		remaining := 100.0 - q.FiveHour.UsedPercent
+		checkWindow = q.FiveHour
+	} else if q.Weekly != nil {
+		checkWindow = q.Weekly
+		windowName = "周"
+	}
+
+	if checkWindow != nil {
+		remaining := 100.0 - checkWindow.UsedPercent
 		if remaining <= minRemaining {
-			desc := fmt.Sprintf("5h 额度已用尽 (剩余 %.1f%%)", remaining)
-			if !q.FiveHour.ResetAt.IsZero() && q.FiveHour.ResetAt.After(now) {
-				countdown := q.FiveHour.ResetAt.Sub(now).Round(time.Minute)
+			desc := fmt.Sprintf("%s 额度已用尽 (剩余 %.1f%%)", windowName, remaining)
+			if !checkWindow.ResetAt.IsZero() && checkWindow.ResetAt.After(now) {
+				countdown := checkWindow.ResetAt.Sub(now).Round(time.Minute)
 				desc += fmt.Sprintf("，预计 %s 后重置", countdown)
 				m.mu.Lock()
-				managed.LockedResetAt = q.FiveHour.ResetAt
+				managed.LockedResetAt = checkWindow.ResetAt
 				m.mu.Unlock()
 			}
 			m.setAccountState(acct.ID, StateCooldown, desc)
@@ -266,11 +381,15 @@ func (m *Manager) reconcileSingleAccount(ctx context.Context, acct *cpa.Account)
 	if currentState == StateCooldown || currentState == StateError || currentState == "" {
 		m.setAccountState(acct.ID, StateReady, "额度健康就绪")
 		if currentState == StateCooldown {
+			prov := acct.Provider
+			if prov == "" {
+				prov = "codex"
+			}
 			m.recordDecision(DecisionView{
-				Provider: "codex",
-				Model:    "codex",
+				Provider: prov,
+				Model:    prov,
 				Outcome:  "rebind",
-				Cause:    fmt.Sprintf("账号 %s 5h 额度已刷新恢复，状态解除冷却转为就绪待命", acct.ID),
+				Cause:    fmt.Sprintf("账号 %s 额度已刷新恢复，状态解除冷却转为就绪待命", acct.ID),
 				AuthID:   acct.ID,
 			})
 		}
@@ -281,99 +400,159 @@ func (m *Manager) evaluateActiveAccount() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	var currentActive *ManagedAccount
-	if m.activeAcctID != "" {
-		currentActive = m.accounts[m.activeAcctID]
+	now := time.Now()
+	minRemaining := m.cfg.Quota.MinRemainingPercent
+	if minRemaining <= 0 {
+		minRemaining = 2.0
 	}
 
-	var oldActiveID string
-	var oldRemaining float64
-
-	// 检查当前主账号是否依然健康
-	if currentActive != nil && currentActive.State == StateActive {
-		minRemaining := m.cfg.Quota.MinRemainingPercent
-		if currentActive.Quota != nil && currentActive.Quota.FiveHour != nil {
-			remaining := 100.0 - currentActive.Quota.FiveHour.UsedPercent
-			if remaining <= minRemaining {
-				log.Printf("[Scheduler] Primary active account %s exhausted (remaining %.1f%%), demoting...", currentActive.Account.ID, remaining)
-				currentActive.State = StateCooldown
-				currentActive.StateDesc = "5h 额度耗尽，已切入冷却"
-				_ = m.cpaClient.UpdateAccountStatus(currentActive.Account.ID, true, 0)
-				oldActiveID = currentActive.Account.ID
-				oldRemaining = remaining
-				currentActive = nil
-				m.activeAcctID = ""
-			}
-		}
-	} else if currentActive != nil && currentActive.State != StateActive {
-		// 已不是 active 状态
-		currentActive = nil
-		m.activeAcctID = ""
-	}
-
-	if currentActive != nil {
-		// 当前主账号健康，继续保持 Fill-First
-		return
-	}
-
-	// 需要推举新的主账号
-	candidates := make([]*ManagedAccount, 0)
+	// 按 Provider 分组评选
+	byProvider := make(map[string][]*ManagedAccount)
 	for _, ma := range m.accounts {
-		if ma.State == StateReady && (ma.Account == nil || !ma.Account.Disabled) {
-			candidates = append(candidates, ma)
+		if ma.Account == nil {
+			continue
 		}
+		prov := ma.Account.Provider
+		if prov == "" {
+			prov = "codex"
+		}
+		byProvider[prov] = append(byProvider[prov], ma)
 	}
 
-	if len(candidates) == 0 {
-		log.Println("[Scheduler] Notice: No ready accounts available in pool. Waiting for cooldown resets.")
-		return
-	}
-
-	// 优先选 5h 剩余额度最充足的账号（Fill-First 主备递补）
-	sort.Slice(candidates, func(i, j int) bool {
-		var remI, remJ float64 = 100, 100
-		if candidates[i].Quota != nil && candidates[i].Quota.FiveHour != nil {
-			remI = 100 - candidates[i].Quota.FiveHour.UsedPercent
+	for prov, accts := range byProvider {
+		currentActiveID := m.activeAcctIDs[prov]
+		if currentActiveID == "" && prov == "codex" {
+			currentActiveID = m.activeAcctID
 		}
-		if candidates[j].Quota != nil && candidates[j].Quota.FiveHour != nil {
-			remJ = 100 - candidates[j].Quota.FiveHour.UsedPercent
-		}
-		return remI > remJ
-	})
 
-	newActive := candidates[0]
-	newActive.State = StateActive
-	newActive.StateDesc = "主力分配中（最高优先级）"
-	if newActive.Account != nil {
-		m.activeAcctID = newActive.Account.ID
-		log.Printf("[Scheduler] Promoted account %s as PRIMARY ACTIVE (priority=100)", newActive.Account.ID)
-		_ = m.cpaClient.UpdateAccountStatus(newActive.Account.ID, false, 100)
+		candidates := make([]Candidate, 0, len(accts))
+		for _, ma := range accts {
+			var remaining, used float64 = 100.0, 0.0
+			var resetAt time.Time
+			isUsable := false
 
-		if oldActiveID != "" {
-			m.recordDecisionLocked(DecisionView{
-				Provider:    "codex",
-				Model:       "codex",
-				Outcome:     "failover",
-				Cause:       fmt.Sprintf("主力账号 %s 5h 额度耗尽(剩余 %.1f%%)，自动熔断；推举 %s 晋升为主力账号", oldActiveID, oldRemaining, newActive.Account.ID),
-				AuthID:      newActive.Account.ID,
-				BoundAuthID: oldActiveID,
-				Fallback:    true,
+			if ma.Quota != nil {
+				isUsable = ma.Quota.IsUsable
+				if ma.Quota.FiveHour != nil {
+					used = ma.Quota.FiveHour.UsedPercent
+					remaining = math.Max(0, 100.0-used)
+					resetAt = ma.Quota.FiveHour.ResetAt
+				} else if ma.Quota.Weekly != nil {
+					used = ma.Quota.Weekly.UsedPercent
+					remaining = math.Max(0, 100.0-used)
+					resetAt = ma.Quota.Weekly.ResetAt
+				}
+			}
+
+			prio := ma.Account.Priority
+			if p, ok := m.accountPrios[ma.Account.ID]; ok {
+				prio = p
+			}
+
+			candidates = append(candidates, Candidate{
+				AccountID:      ma.Account.ID,
+				Provider:       prov,
+				PluginPriority: prio,
+				HostPriority:   ma.Account.Priority,
+				Remaining:      remaining,
+				FiveHourUsed:   used,
+				ResetsAt:       resetAt,
+				IsUsable:       isUsable,
+				Disabled:       ma.Account.Disabled || ma.State == StateDisabled,
 			})
+		}
+
+		strategy := m.cfg.Scheduler.Strategy
+		if strategy == "" {
+			strategy = StrategyFillFirst
+		}
+
+		ranked, skipped := RankCandidates(candidates, strategy, now, currentActiveID, minRemaining)
+
+		rankedAny := make([]any, len(ranked))
+		for i, r := range ranked {
+			rankedAny[i] = r
+		}
+		skippedAny := make([]any, len(skipped))
+		for i, s := range skipped {
+			skippedAny[i] = s
+		}
+
+		if len(ranked) > 0 {
+			winnerID := ranked[0].AccountID
+			winnerAcct := m.accounts[winnerID]
+
+			if winnerID != currentActiveID {
+				log.Printf("[Scheduler] [%s] Promoting %s as PRIMARY ACTIVE (strategy: %s, score: %.2f)", prov, winnerID, strategy, ranked[0].Score)
+				if currentActiveID != "" {
+					if oldMa, ok := m.accounts[currentActiveID]; ok {
+						if oldMa.State == StateActive {
+							var oldRem float64 = 100.0
+							if oldMa.Quota != nil {
+								if oldMa.Quota.FiveHour != nil {
+									oldRem = 100.0 - oldMa.Quota.FiveHour.UsedPercent
+								} else if oldMa.Quota.Weekly != nil {
+									oldRem = 100.0 - oldMa.Quota.Weekly.UsedPercent
+								}
+							}
+							if oldRem <= minRemaining {
+								oldMa.State = StateCooldown
+								oldMa.StateDesc = fmt.Sprintf("额度已耗尽 (剩余 %.1f%%)，切入冷却", oldRem)
+								_ = m.cpaClient.UpdateAccountStatus(oldMa.Account.ID, true, 0)
+							} else {
+								oldMa.State = StateReady
+								oldMa.StateDesc = "备用待命"
+								_ = m.cpaClient.UpdateAccountStatus(oldMa.Account.ID, false, 10)
+							}
+						}
+					}
+				}
+
+				winnerAcct.State = StateActive
+				winnerAcct.StateDesc = "主力分配中（最高优先级）"
+				_ = m.cpaClient.UpdateAccountStatus(winnerAcct.Account.ID, false, 100)
+
+				m.activeAcctIDs[prov] = winnerID
+				if prov == "codex" || m.activeAcctID == "" {
+					m.activeAcctID = winnerID
+				}
+
+				m.recordDecisionLocked(DecisionView{
+					Provider:         prov,
+					Model:            prov,
+					Policy:           strategy,
+					Outcome:          "new_session",
+					Cause:            fmt.Sprintf("[%s] 调度策略 %s 推举 %s 晋升主力账号 (得分: %.2f)", prov, strategy, winnerID, ranked[0].Score),
+					AuthID:           winnerID,
+					BoundAuthID:      currentActiveID,
+					Ranked:           rankedAny,
+					Skipped:          skippedAny,
+					AffinityOverrode: false,
+					Fallback:         currentActiveID != "",
+				})
+			} else {
+				winnerAcct.State = StateActive
+				winnerAcct.StateDesc = "主力分配中（最高优先级）"
+			}
+
+			// 其他就绪候选账号更新为备用状态 (priority=10)
+			for _, r := range ranked[1:] {
+				if standby, ok := m.accounts[r.AccountID]; ok {
+					if standby.State == StateActive {
+						standby.State = StateReady
+						standby.StateDesc = "备用待命"
+					}
+					_ = m.cpaClient.UpdateAccountStatus(standby.Account.ID, false, 10)
+				}
+			}
 		} else {
-			m.recordDecisionLocked(DecisionView{
-				Provider: "codex",
-				Model:    "codex",
-				Outcome:  "new_session",
-				Cause:    fmt.Sprintf("推举可用账号 %s 晋升为主力账号", newActive.Account.ID),
-				AuthID:   newActive.Account.ID,
-			})
-		}
-	}
-
-	// 其他 ready 账号设为备用可用 (priority=10)
-	for _, c := range candidates[1:] {
-		if c.Account != nil {
-			_ = m.cpaClient.UpdateAccountStatus(c.Account.ID, false, 10)
+			if currentActiveID != "" {
+				log.Printf("[Scheduler] [%s] Notice: No eligible accounts available in pool. Demoting %s", prov, currentActiveID)
+				m.activeAcctIDs[prov] = ""
+				if m.activeAcctID == currentActiveID {
+					m.activeAcctID = ""
+				}
+			}
 		}
 	}
 }
@@ -402,8 +581,18 @@ func (m *Manager) ManualSwitch(accountID string) error {
 		return fmt.Errorf("account not found: %s", accountID)
 	}
 
-	if m.activeAcctID != "" && m.activeAcctID != accountID {
-		if old, exists := m.accounts[m.activeAcctID]; exists {
+	prov := "codex"
+	if target.Account != nil && target.Account.Provider != "" {
+		prov = target.Account.Provider
+	}
+
+	oldActiveID := m.activeAcctIDs[prov]
+	if oldActiveID == "" && prov == "codex" {
+		oldActiveID = m.activeAcctID
+	}
+
+	if oldActiveID != "" && oldActiveID != accountID {
+		if old, exists := m.accounts[oldActiveID]; exists {
 			old.State = StateReady
 			old.StateDesc = "备用待命"
 			_ = m.cpaClient.UpdateAccountStatus(old.Account.ID, false, 10)
@@ -412,17 +601,21 @@ func (m *Manager) ManualSwitch(accountID string) error {
 
 	target.State = StateActive
 	target.StateDesc = "手动指定主力"
-	m.activeAcctID = accountID
+	m.activeAcctIDs[prov] = accountID
+	if prov == "codex" || m.activeAcctID == "" {
+		m.activeAcctID = accountID
+	}
+
 	m.recordDecisionLocked(DecisionView{
-		Provider: "codex",
-		Model:    "codex",
+		Provider: prov,
+		Model:    prov,
 		Outcome:  "rebind",
-		Cause:    fmt.Sprintf("管理员手动指定 %s 为当前主力账号", accountID),
+		Cause:    fmt.Sprintf("管理员手动指定 %s 为当前 [%s] 主力账号", accountID, prov),
 		AuthID:   accountID,
 	})
 	m.mu.Unlock()
 
-	log.Printf("[Scheduler] Manually switched active account to %s", accountID)
+	log.Printf("[Scheduler] Manually switched [%s] active account to %s", prov, accountID)
 	return m.cpaClient.UpdateAccountStatus(accountID, false, 100)
 }
 
@@ -433,7 +626,6 @@ func (m *Manager) executeProbeAndRefresh(ctx context.Context, acct *cpa.Account,
 		managed.LastProbeAt = time.Now()
 		m.mu.Unlock()
 
-		// 等待 2 秒让 OpenAI 配额后端刷新
 		time.Sleep(2 * time.Second)
 		freshQ, fetchErr := m.fetcher.Fetch(acct)
 		if fetchErr == nil && freshQ != nil {
@@ -441,7 +633,7 @@ func (m *Manager) executeProbeAndRefresh(ctx context.Context, acct *cpa.Account,
 			managed.Quota = freshQ
 			if freshQ.FiveHour != nil {
 				managed.LastResetAt = freshQ.FiveHour.ResetAt
-				managed.LockedResetAt = time.Time{} // 解除冷却锁定
+				managed.LockedResetAt = time.Time{}
 			}
 			m.mu.Unlock()
 		}
@@ -467,7 +659,7 @@ func (m *Manager) ManualProbe(ctx context.Context, accountID string) (*probe.Eve
 		AuthID:   accountID,
 	})
 
-	ev, err := m.prober.Execute(ctx, ma.Account)
+	ev, err := m.prober.ExecuteForced(ctx, ma.Account)
 	if err == nil && ev.Success {
 		m.mu.Lock()
 		ma.LastProbeAt = time.Now()
@@ -580,24 +772,30 @@ func (m *Manager) Overview() map[string]any {
 	}
 
 	codexSum := summary["codex"].(map[string]any)
+	claudeSum := summary["claude"].(map[string]any)
 	resets := make([]map[string]any, 0)
 	var lastRefresh *time.Time
 
 	for _, a := range accounts {
-		codexSum["total"] = codexSum["total"].(int) + 1
+		prov, _ := a["provider"].(string)
+		sum := codexSum
+		if prov == "claude" {
+			sum = claudeSum
+		}
+		sum["total"] = sum["total"].(int) + 1
 		state := a["quota_state"].(string)
 		routing := a["routing"].(string)
 		switch {
 		case state == "exhausted":
-			codexSum["exhausted"] = codexSum["exhausted"].(int) + 1
+			sum["exhausted"] = sum["exhausted"].(int) + 1
 		case routing == "eligible":
-			codexSum["eligible"] = codexSum["eligible"].(int) + 1
+			sum["eligible"] = sum["eligible"].(int) + 1
 		case routing == "blocked":
-			codexSum["blocked"] = codexSum["blocked"].(int) + 1
+			sum["blocked"] = sum["blocked"].(int) + 1
 		case state == "unknown" || state == "stale":
-			codexSum["unknown"] = codexSum["unknown"].(int) + 1
+			sum["unknown"] = sum["unknown"].(int) + 1
 		default:
-			codexSum["limited"] = codexSum["limited"].(int) + 1
+			sum["limited"] = sum["limited"].(int) + 1
 		}
 
 		if nr, ok := a["next_reset"].(*time.Time); ok && nr != nil {
@@ -605,7 +803,7 @@ func (m *Manager) Overview() map[string]any {
 				resets = append(resets, map[string]any{
 					"auth_id":           a["id"],
 					"account":           a["display"],
-					"provider":          "codex",
+					"provider":          prov,
 					"resets_at":         nr,
 					"remaining_percent": a["remaining_percent"],
 				})
@@ -620,18 +818,32 @@ func (m *Manager) Overview() map[string]any {
 	}
 
 	nextUp := make([]map[string]any, 0)
-	if m.activeAcctID != "" {
-		nextUp = append(nextUp, map[string]any{
-			"provider": "codex",
-			"model":    "gpt-5.6-luna",
-			"policy":   m.cfg.Scheduler.Strategy,
-			"auth_id":  m.activeAcctID,
-			"account":  m.activeAcctID,
-			"reason":   "Primary active account",
-			"fallback": false,
-			"ranked":   []any{},
-			"skipped":  []any{},
-		})
+	for _, p := range []string{"codex", "claude"} {
+		actID := m.activeAcctIDs[p]
+		if actID == "" && p == "codex" {
+			actID = m.activeAcctID
+		}
+		if actID != "" {
+			disp := actID
+			if alias, ok := m.accountAliases[actID]; ok && alias != "" {
+				disp = alias
+			}
+			model := m.cfg.Probe.Model
+			if p == "claude" {
+				model = "claude-3-7-sonnet"
+			}
+			nextUp = append(nextUp, map[string]any{
+				"provider": p,
+				"model":    model,
+				"policy":   m.cfg.Scheduler.Strategy,
+				"auth_id":  actID,
+				"account":  disp,
+				"reason":   "Primary active account",
+				"fallback": false,
+				"ranked":   []any{},
+				"skipped":  []any{},
+			})
+		}
 	}
 
 	return map[string]any{
@@ -675,9 +887,24 @@ func (m *Manager) buildAccountViewsLocked(now time.Time) []map[string]any {
 			continue
 		}
 
+		prov := acct.Provider
+		if prov == "" {
+			prov = "codex"
+		}
+
 		display := acct.Email
 		if display == "" {
 			display = acct.ID
+		}
+		alias := acct.Email
+		if a, ok := m.accountAliases[acct.ID]; ok && a != "" {
+			alias = a
+			display = a
+		}
+
+		prio := acct.Priority
+		if p, ok := m.accountPrios[acct.ID]; ok {
+			prio = p
 		}
 
 		windows := make([]map[string]any, 0)
@@ -749,7 +976,12 @@ func (m *Manager) buildAccountViewsLocked(now time.Time) []map[string]any {
 			routing = "eligible"
 		}
 
-		plan := "Codex Subscription"
+		plan := "Subscription"
+		if prov == "codex" {
+			plan = "Codex Subscription"
+		} else if prov == "claude" {
+			plan = "Claude Pro / Team"
+		}
 		if ma.Quota != nil && ma.Quota.PlanType != "" {
 			plan = ma.Quota.PlanType
 		}
@@ -760,19 +992,19 @@ func (m *Manager) buildAccountViewsLocked(now time.Time) []map[string]any {
 			lastPoll = &t
 		}
 
-		isPreferred := (m.activeAcctID == acct.ID)
+		isPreferred := (m.activeAcctIDs[prov] == acct.ID || m.activeAcctID == acct.ID)
 
 		item := map[string]any{
 			"id":                acct.ID,
 			"display":           display,
-			"alias":             acct.Email,
-			"provider":          "codex",
+			"alias":             alias,
+			"provider":          prov,
 			"plan":              plan,
 			"present":           true,
 			"disabled":          acct.Disabled,
 			"unavailable":       false,
 			"host_priority":     acct.Priority,
-			"plugin_priority":   acct.Priority,
+			"plugin_priority":   prio,
 			"polled":            ma.Quota != nil,
 			"poll_error":        ma.StateDesc,
 			"last_poll_at":      lastPoll,
@@ -831,10 +1063,10 @@ func (m *Manager) SettingsView() map[string]any {
 		{
 			"name":        "strategy",
 			"type":        "enum",
-			"enum":        []string{"fill_first", "reset_first", "quota_pressure", "balanced"},
+			"enum":        []string{"fill_first", "reset_first", "quota_pressure", "balanced", "manual_priority"},
 			"default":     "fill_first",
 			"group":       "Routing",
-			"description": "How accounts are prioritized (fill_first, reset_first, etc.)",
+			"description": "How accounts are prioritized (fill_first, reset_first, quota_pressure, balanced, manual_priority)",
 			"effect":      "Affects primary active account selection.",
 		},
 		{
@@ -915,16 +1147,126 @@ func (m *Manager) Labels() map[string]string {
 	defer m.mu.RUnlock()
 
 	labels := make(map[string]string)
+	for id, alias := range m.accountAliases {
+		if alias != "" {
+			labels[id] = alias
+		}
+	}
 	for _, ma := range m.accounts {
 		if ma.Account != nil {
-			if ma.Account.Email != "" {
-				labels[ma.Account.ID] = ma.Account.Email
-			} else {
-				labels[ma.Account.ID] = ma.Account.ID
+			if _, ok := labels[ma.Account.ID]; !ok {
+				if ma.Account.Email != "" {
+					labels[ma.Account.ID] = ma.Account.Email
+				} else {
+					labels[ma.Account.ID] = ma.Account.ID
+				}
 			}
 		}
 	}
 	return labels
+}
+
+func (m *Manager) Simulate(provider, model string, strategies []string) []map[string]any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if provider == "" {
+		provider = "codex"
+	}
+	if len(strategies) == 0 {
+		strategies = []string{StrategyFillFirst, StrategyResetFirst, StrategyQuotaPressure, StrategyBalanced, StrategyManualPriority}
+	}
+	if model == "" {
+		if provider == "claude" {
+			model = "claude-3-7-sonnet"
+		} else {
+			model = m.cfg.Probe.Model
+		}
+	}
+
+	now := time.Now()
+	minRemaining := m.cfg.Quota.MinRemainingPercent
+	if minRemaining <= 0 {
+		minRemaining = 2.0
+	}
+
+	currentActiveID := m.activeAcctIDs[provider]
+	if currentActiveID == "" && provider == "codex" {
+		currentActiveID = m.activeAcctID
+	}
+
+	var candidates []Candidate
+	for _, ma := range m.accounts {
+		if ma.Account == nil {
+			continue
+		}
+		p := ma.Account.Provider
+		if p == "" {
+			p = "codex"
+		}
+		if p != provider {
+			continue
+		}
+
+		var remaining, used float64 = 100.0, 0.0
+		var resetAt time.Time
+		isUsable := false
+
+		if ma.Quota != nil {
+			isUsable = ma.Quota.IsUsable
+			if ma.Quota.FiveHour != nil {
+				used = ma.Quota.FiveHour.UsedPercent
+				remaining = math.Max(0, 100.0-used)
+				resetAt = ma.Quota.FiveHour.ResetAt
+			} else if ma.Quota.Weekly != nil {
+				used = ma.Quota.Weekly.UsedPercent
+				remaining = math.Max(0, 100.0-used)
+				resetAt = ma.Quota.Weekly.ResetAt
+			}
+		}
+
+		prio := ma.Account.Priority
+		if pr, ok := m.accountPrios[ma.Account.ID]; ok {
+			prio = pr
+		}
+
+		candidates = append(candidates, Candidate{
+			AccountID:      ma.Account.ID,
+			Provider:       provider,
+			PluginPriority: prio,
+			HostPriority:   ma.Account.Priority,
+			Remaining:      remaining,
+			FiveHourUsed:   used,
+			ResetsAt:       resetAt,
+			IsUsable:       isUsable,
+			Disabled:       ma.Account.Disabled || ma.State == StateDisabled,
+		})
+	}
+
+	results := make([]map[string]any, 0, len(strategies))
+	for _, st := range strategies {
+		ranked, skipped := RankCandidates(candidates, st, now, currentActiveID, minRemaining)
+		var winnerID, disp, reason string
+		if len(ranked) > 0 {
+			winnerID = ranked[0].AccountID
+			disp = winnerID
+			if a, ok := m.accountAliases[winnerID]; ok && a != "" {
+				disp = a
+			}
+			reason = ranked[0].Reason
+		}
+		results = append(results, map[string]any{
+			"provider": provider,
+			"model":    model,
+			"policy":   st,
+			"auth_id":  winnerID,
+			"account":  disp,
+			"reason":   reason,
+			"ranked":   ranked,
+			"skipped":  skipped,
+		})
+	}
+	return results
 }
 
 func (m *Manager) Config() *config.Config {

@@ -9,4 +9,5 @@ services:
       - BASE_PATH=/cuota  # 可选：通过环境变量自定义访问子路径（如 /cuota）
     volumes:
       - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
       - ~/.cli-proxy-api:/root/.cli-proxy-api
