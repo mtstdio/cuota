@@ -29,6 +29,7 @@ type Candidate struct {
 	ResetsAt       time.Time
 	IsUsable       bool
 	Disabled       bool
+	CircuitOpen    bool
 }
 
 type RankedCandidate struct {
@@ -64,6 +65,13 @@ func RankCandidates(
 			skipped = append(skipped, SkippedCandidate{
 				AccountID: c.AccountID,
 				Reason:    "disabled",
+			})
+			continue
+		}
+		if c.CircuitOpen {
+			skipped = append(skipped, SkippedCandidate{
+				AccountID: c.AccountID,
+				Reason:    "circuit_open",
 			})
 			continue
 		}

@@ -54,8 +54,11 @@ func (c *Client) LoadAccounts() ([]*Account, error) {
 						continue
 					}
 					acct, err := ParseAccountJSON(entry.Name(), data)
-					if err != nil || acct.Provider != "codex" || acct.AccessToken == "" {
+					if err != nil || (acct.Provider != "codex" && acct.Provider != "claude") || acct.AccessToken == "" {
 						continue
+					}
+					if fileInfo, err := entry.Info(); err == nil && fileInfo != nil {
+						acct.ModTime = fileInfo.ModTime()
 					}
 					accounts = append(accounts, acct)
 				}

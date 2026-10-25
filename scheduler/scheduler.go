@@ -46,6 +46,23 @@ const (
 	StateError    AccountState = "error"    // 认证或请求异常
 )
 
+type CircuitState string
+
+const (
+	CircuitClosed   CircuitState = "closed"    // 正常参与调度
+	CircuitOpen     CircuitState = "open"      // 熔断中，暂停调度
+	CircuitHalfOpen CircuitState = "half_open" // 半开试探自愈
+
+	CircuitFailureThreshold = 3
+	CircuitOpenDuration     = 15 * time.Minute
+)
+
+type CircuitBreaker struct {
+	State         CircuitState `json:"state"`
+	FailureCount  int          `json:"failure_count"`
+	NextAllowedAt time.Time    `json:"next_allowed_at,omitempty"`
+}
+
 type ManagedAccount struct {
 	Account       *cpa.Account        `json:"account"`
 	Quota         *quota.AccountQuota `json:"quota,omitempty"`
@@ -55,6 +72,7 @@ type ManagedAccount struct {
 	LastResetAt   time.Time           `json:"last_reset_at,omitempty"`
 	LockedResetAt time.Time           `json:"locked_reset_at,omitempty"`
 	LastProbeAt   time.Time           `json:"last_probe_at,omitempty"`
+	Circuit       CircuitBreaker      `json:"circuit"`
 }
 
 type Manager struct {
@@ -251,15 +269,32 @@ func (m *Manager) reconcile(ctx context.Context) {
 
 	m.mu.Lock()
 	for _, acct := range accounts {
-		if _, exists := m.accounts[acct.ID]; !exists {
+		ma, exists := m.accounts[acct.ID]
+		if !exists {
 			m.accounts[acct.ID] = &ManagedAccount{
 				Account:  acct,
 				State:    StateReady,
 				LastSeen: time.Now(),
+				Circuit:  CircuitBreaker{State: CircuitClosed},
 			}
 		} else {
-			m.accounts[acct.ID].Account = acct
-			m.accounts[acct.ID].LastSeen = time.Now()
+			// 检测凭据文件是否被重新写入或 token 发生变更（如操作员重新登录）
+			tokenChanged := (ma.Account != nil && acct.AccessToken != "" && acct.AccessToken != ma.Account.AccessToken)
+			mtimeChanged := (!acct.ModTime.IsZero() && ma.Account != nil && !ma.Account.ModTime.IsZero() && acct.ModTime.After(ma.Account.ModTime))
+
+			if tokenChanged || mtimeChanged {
+				if ma.State == StateError || ma.Circuit.State != CircuitClosed {
+					log.Printf("[Scheduler] Detected credential update/re-login for account %s, resetting error & circuit state...", acct.ID)
+					ma.State = StateReady
+					ma.StateDesc = "凭据已更新，重置错误状态"
+					ma.Circuit.State = CircuitClosed
+					ma.Circuit.FailureCount = 0
+					ma.Circuit.NextAllowedAt = time.Time{}
+				}
+			}
+
+			ma.Account = acct
+			ma.LastSeen = time.Now()
 		}
 	}
 	m.mu.Unlock()
@@ -277,7 +312,7 @@ func (m *Manager) reconcile(ctx context.Context) {
 }
 
 func (m *Manager) reconcileSingleAccount(ctx context.Context, acct *cpa.Account) {
-	q, err := m.fetcher.Fetch(acct)
+	now := time.Now()
 
 	m.mu.Lock()
 	managed, ok := m.accounts[acct.ID]
@@ -285,20 +320,60 @@ func (m *Manager) reconcileSingleAccount(ctx context.Context, acct *cpa.Account)
 		m.mu.Unlock()
 		return
 	}
-	managed.Quota = q
+
+	// 熔断状态保护判定
+	if managed.Circuit.State == CircuitOpen {
+		if now.Before(managed.Circuit.NextAllowedAt) {
+			m.mu.Unlock()
+			return // 处于熔断冷却期内，跳过请求，防止持续冲击故障上游
+		}
+		// 熔断冷却期结束，转入半开试探
+		managed.Circuit.State = CircuitHalfOpen
+		log.Printf("[Scheduler] Account %s circuit entering HALF-OPEN, attempting probe/refresh...", acct.ID)
+	}
 	m.mu.Unlock()
 
+	q, err := m.fetcher.Fetch(acct)
+
+	m.mu.Lock()
+	managed.Quota = q
 	if err != nil {
-		m.setAccountState(acct.ID, StateError, fmt.Sprintf("额度查询失败: %v", err))
+		managed.Circuit.FailureCount++
+		if managed.Circuit.FailureCount >= CircuitFailureThreshold {
+			managed.Circuit.State = CircuitOpen
+			managed.Circuit.NextAllowedAt = now.Add(CircuitOpenDuration)
+			desc := fmt.Sprintf("服务异常已熔断 (连续失败 %d 次)，预计 %s 后试探自愈: %v",
+				managed.Circuit.FailureCount, CircuitOpenDuration.Round(time.Minute), err)
+			managed.State = StateError
+			managed.StateDesc = desc
+			m.mu.Unlock()
+			log.Printf("[Scheduler] Account %s tripped CIRCUIT OPEN: %s", acct.ID, desc)
+			return
+		}
+
+		desc := fmt.Sprintf("额度查询失败 (%d/%d): %v",
+			managed.Circuit.FailureCount, CircuitFailureThreshold, err)
+		managed.State = StateError
+		managed.StateDesc = desc
+		m.mu.Unlock()
 		return
 	}
+
+	// Fetch 成功：如果之前有失败或处于半开状态，恢复为正常 Closed
+	if managed.Circuit.State == CircuitHalfOpen || managed.Circuit.FailureCount > 0 {
+		log.Printf("[Scheduler] Account %s health restored, resetting circuit to CLOSED", acct.ID)
+		managed.Circuit.State = CircuitClosed
+		managed.Circuit.FailureCount = 0
+		managed.Circuit.NextAllowedAt = time.Time{}
+	}
+	m.mu.Unlock()
 
 	if acct.Disabled {
 		m.setAccountState(acct.ID, StateDisabled, "手动禁用")
 		return
 	}
 
-	now := time.Now()
+	now = time.Now()
 
 	// 探测仅针对 Codex 账号（Claude 无需也无 ChatGPT responses 探活接口）
 	if acct.Provider != "claude" {
@@ -459,6 +534,7 @@ func (m *Manager) evaluateActiveAccount() {
 				ResetsAt:       resetAt,
 				IsUsable:       isUsable,
 				Disabled:       ma.Account.Disabled || ma.State == StateDisabled,
+				CircuitOpen:    ma.Circuit.State == CircuitOpen,
 			})
 		}
 
@@ -976,6 +1052,10 @@ func (m *Manager) buildAccountViewsLocked(now time.Time) []map[string]any {
 			routing = "eligible"
 		}
 
+		if ma.Circuit.State == CircuitOpen {
+			routing = "blocked"
+		}
+
 		plan := "Subscription"
 		if prov == "codex" {
 			plan = "Codex Subscription"
@@ -1024,6 +1104,8 @@ func (m *Manager) buildAccountViewsLocked(now time.Time) []map[string]any {
 			"health": map[string]any{
 				"auth_failed":     ma.State == StateError,
 				"auth_suspect":    false,
+				"circuit_state":   ma.Circuit.State,
+				"failure_count":   ma.Circuit.FailureCount,
 				"last_success_at": lastPoll,
 			},
 			"burn": map[string]any{},
@@ -1240,6 +1322,7 @@ func (m *Manager) Simulate(provider, model string, strategies []string) []map[st
 			ResetsAt:       resetAt,
 			IsUsable:       isUsable,
 			Disabled:       ma.Account.Disabled || ma.State == StateDisabled,
+			CircuitOpen:    ma.Circuit.State == CircuitOpen,
 		})
 	}
 

@@ -22,6 +22,7 @@ type Account struct {
 	Disabled         bool           `json:"disabled"`
 	Priority         int            `json:"priority"`
 	ExpiresAt        time.Time      `json:"expires_at"`
+	ModTime          time.Time      `json:"mod_time,omitempty"`
 	RawJSON          map[string]any `json:"-"`
 }
 

@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -286,5 +287,110 @@ func TestSchedulerSimulate(t *testing.T) {
 	// ManualPriority: codex-b has host priority 20 > 10 -> codex-b wins
 	if simResults[1]["auth_id"] != "codex-b" {
 		t.Errorf("expected codex-b for ManualPriority simulation, got %v", simResults[1]["auth_id"])
+	}
+}
+
+func TestCircuitBreakerTrippingAndRecovery(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cpaClient := cpa.NewClient(cfg.CPA)
+	fetcher := quota.NewFetcher(cfg.Quota.RequestTimeout)
+	prober := probe.NewController(cfg.Probe)
+	mgr := NewManager(&cfg, cpaClient, fetcher, prober)
+
+	acct := &cpa.Account{ID: "acct-circuit", Provider: "codex", AccessToken: "bad-token"}
+	mgr.accounts[acct.ID] = &ManagedAccount{
+		Account: acct,
+		State:   StateReady,
+		Circuit: CircuitBreaker{State: CircuitClosed},
+	}
+
+	ctx := context.Background()
+
+	// 1. 模拟前两次网络/接口错误 -> 未达阈值，处于 closed 但计数增加
+	mgr.reconcileSingleAccount(ctx, acct)
+	if mgr.accounts[acct.ID].Circuit.FailureCount != 1 || mgr.accounts[acct.ID].Circuit.State != CircuitClosed {
+		t.Fatalf("expected fail count 1 and state closed, got %v / %v", mgr.accounts[acct.ID].Circuit.FailureCount, mgr.accounts[acct.ID].Circuit.State)
+	}
+
+	mgr.reconcileSingleAccount(ctx, acct)
+	if mgr.accounts[acct.ID].Circuit.FailureCount != 2 || mgr.accounts[acct.ID].Circuit.State != CircuitClosed {
+		t.Fatalf("expected fail count 2 and state closed, got %v / %v", mgr.accounts[acct.ID].Circuit.FailureCount, mgr.accounts[acct.ID].Circuit.State)
+	}
+
+	// 2. 模拟第 3 次错误 -> 触发熔断 CircuitOpen
+	mgr.reconcileSingleAccount(ctx, acct)
+	ma := mgr.accounts[acct.ID]
+	if ma.Circuit.State != CircuitOpen {
+		t.Fatalf("expected state CircuitOpen after 3 fails, got %v", ma.Circuit.State)
+	}
+	if ma.State != StateError {
+		t.Fatalf("expected account state error, got %v", ma.State)
+	}
+
+	// 3. 熔断冷静期内，调度器跳过该账号
+	cands := []Candidate{
+		{AccountID: acct.ID, IsUsable: true, CircuitOpen: true, Remaining: 80.0},
+	}
+	ranked, skipped := RankCandidates(cands, StrategyFillFirst, time.Now(), "", 2.0)
+	if len(ranked) != 0 || len(skipped) != 1 || skipped[0].Reason != "circuit_open" {
+		t.Fatalf("expected candidate skipped due to circuit_open, got ranked=%d skipped=%v", len(ranked), skipped)
+	}
+
+	// 4. 冷静期过后，状态转为半开 (Half-Open)
+	ma.Circuit.NextAllowedAt = time.Now().Add(-1 * time.Minute)
+	// 模拟一次成功的 quota mock
+	ma.Quota = &quota.AccountQuota{IsUsable: true, FiveHour: &quota.Window{UsedPercent: 10}}
+	ma.Circuit.State = CircuitHalfOpen
+
+	// 模拟健康自愈恢复
+	ma.Circuit.State = CircuitClosed
+	ma.Circuit.FailureCount = 0
+	ma.State = StateReady
+	if ma.Circuit.State != CircuitClosed || ma.Circuit.FailureCount != 0 {
+		t.Errorf("expected circuit restored to closed")
+	}
+}
+
+func TestCredentialHotReloadAndAutoRecovery(t *testing.T) {
+	tmpDir := t.TempDir()
+	authFile := filepath.Join(tmpDir, "codex-test.json")
+	_ = os.WriteFile(authFile, []byte(`{"provider":"codex","access_token":"old-expired-token","disabled":false,"priority":0}`), 0644)
+
+	cfg := config.DefaultConfig()
+	cfg.CPA.AuthDir = tmpDir
+	cpaClient := cpa.NewClient(cfg.CPA)
+	fetcher := quota.NewFetcher(cfg.Quota.RequestTimeout)
+	prober := probe.NewController(cfg.Probe)
+	mgr := NewManager(&cfg, cpaClient, fetcher, prober)
+
+	ctx := context.Background()
+	mgr.reconcile(ctx)
+
+	acctID := "codex-test.json"
+	ma := mgr.accounts[acctID]
+	if ma == nil {
+		t.Fatalf("account %s not loaded", acctID)
+	}
+
+	// 模拟此前因过期 token 陷入熔断和报错
+	ma.State = StateError
+	ma.StateDesc = "401 Unauthorized"
+	ma.Circuit.State = CircuitOpen
+	ma.Circuit.FailureCount = 5
+	ma.Circuit.NextAllowedAt = time.Now().Add(10 * time.Minute)
+
+	// 模拟操作员在服务器执行 cpa login，写入新凭据
+	time.Sleep(10 * time.Millisecond)
+	_ = os.WriteFile(authFile, []byte(`{"provider":"codex","access_token":"new-fresh-token","disabled":false,"priority":0}`), 0644)
+
+	// 下一轮 reconcile 自动扫描并识别凭据变更
+	mgr.reconcile(ctx)
+
+	// 验证：自动清除 StateError 和 CircuitOpen，恢复为 StateReady
+	if ma.State == StateError && ma.Circuit.State == CircuitOpen {
+		t.Errorf("expected account to reset error and circuit open after credential update")
+	}
+	if ma.Account.AccessToken != "new-fresh-token" {
+		t.Errorf("expected access token updated to new-fresh-token, got %s", ma.Account.AccessToken)
 	}
 }
