@@ -36,40 +36,54 @@ func NewServer(cfg config.ServerConfig, sm *scheduler.Manager) *Server {
 	}
 }
 
-func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
-	expectedPass := s.cfg.Password
-	if expectedPass == "" && s.scheduler != nil && s.scheduler.Config() != nil {
-		expectedPass = s.scheduler.Config().CPA.SecretKey
-	}
-	expectedUser := s.cfg.Username
-
-	if expectedUser == "" && expectedPass == "" {
-		return next
-	}
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 1. 支持 Bearer Token 快速接入
+		// 1. 静态资源与前端页面路由直接放行，不拦截页面渲染
+		cleanPath := r.URL.Path
+		if s.cfg.BasePath != "" {
+			cleanPath = strings.TrimPrefix(cleanPath, config.CleanBasePath(s.cfg.BasePath))
+		}
+		if !strings.HasPrefix(cleanPath, "/api/") && !strings.HasPrefix(cleanPath, "/v0/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 2. 确定预期的 SecretKey（优先 cpa.secret_key，其次兼容 server.password）
+		expectedSecret := ""
+		if s.scheduler != nil && s.scheduler.Config() != nil && s.scheduler.Config().CPA.SecretKey != "" {
+			expectedSecret = s.scheduler.Config().CPA.SecretKey
+		} else if s.cfg.Password != "" {
+			expectedSecret = s.cfg.Password
+		}
+
+		// 若未配置任何密钥，则为免密放行模式
+		if expectedSecret == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 3. 提取请求凭据：支持 Bearer Token 与 Basic Auth 格式
+		var token string
 		authHeader := r.Header.Get("Authorization")
 		if strings.HasPrefix(authHeader, "Bearer ") {
-			token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
-			if token != "" && expectedPass != "" && subtle.ConstantTimeCompare([]byte(token), []byte(expectedPass)) == 1 {
-				next.ServeHTTP(w, r)
-				return
-			}
+			token = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		} else if _, pass, ok := r.BasicAuth(); ok {
+			token = pass
 		}
 
-		// 2. HTTP Basic 校验
-		user, pass, ok := r.BasicAuth()
-		if ok {
-			userMatch := (expectedUser == "" || subtle.ConstantTimeCompare([]byte(user), []byte(expectedUser)) == 1)
-			passMatch := (expectedPass == "" || subtle.ConstantTimeCompare([]byte(pass), []byte(expectedPass)) == 1)
-			if userMatch && passMatch {
-				next.ServeHTTP(w, r)
-				return
-			}
+		// 4. 恒定时间安全比对
+		if token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(expectedSecret)) == 1 {
+			next.ServeHTTP(w, r)
+			return
 		}
 
-		w.Header().Set("WWW-Authenticate", `Basic realm="Cuota Management"`)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		// 5. 鉴权失败：返回纯净 JSON 401，坚决不设置 WWW-Authenticate 响应头，彻底绝迹浏览器原生弹窗
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":   "unauthorized",
+			"message": "Missing or invalid management key",
+		})
 	})
 }
 
@@ -170,7 +184,7 @@ func (s *Server) Start(ctx context.Context) error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 	s.srv = &http.Server{
 		Addr:         addr,
-		Handler:      s.basicAuthMiddleware(rootHandler),
+		Handler:      s.authMiddleware(rootHandler),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 	}

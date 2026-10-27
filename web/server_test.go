@@ -61,60 +61,61 @@ func TestWebServerEndpoints(t *testing.T) {
 	}
 }
 
-func TestBasicAuthMiddleware(t *testing.T) {
+func TestAuthMiddleware(t *testing.T) {
 	cfg := config.ServerConfig{
-		Username: "admin",
 		Password: "secretpassword",
 	}
 	srv := NewServer(cfg, nil)
 
-	handler := srv.basicAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := srv.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	}))
 
-	// 1. 无凭证 -> 401
-	req1 := httptest.NewRequest(http.MethodGet, "/", nil)
-	w1 := httptest.NewRecorder()
-	handler.ServeHTTP(w1, req1)
-	if w1.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401 Unauthorized, got %d", w1.Code)
+	// 1. 静态资源路由（如 / 或 /assets/index.js）无凭证直通放行 -> 200
+	reqStatic := httptest.NewRequest(http.MethodGet, "/", nil)
+	wStatic := httptest.NewRecorder()
+	handler.ServeHTTP(wStatic, reqStatic)
+	if wStatic.Code != http.StatusOK {
+		t.Errorf("expected static request to bypass auth with 200, got %d", wStatic.Code)
 	}
 
-	// 2. 错误凭证 -> 401
-	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
-	req2.SetBasicAuth("admin", "wrongpassword")
-	w2 := httptest.NewRecorder()
-	handler.ServeHTTP(w2, req2)
-	if w2.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401 for wrong password, got %d", w2.Code)
+	// 2. API 请求无凭据 -> 401，且绝不包含 WWW-Authenticate 响应头
+	reqAPI := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	wAPI := httptest.NewRecorder()
+	handler.ServeHTTP(wAPI, reqAPI)
+	if wAPI.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for API without key, got %d", wAPI.Code)
+	}
+	if wAPI.Header().Get("WWW-Authenticate") != "" {
+		t.Errorf("WWW-Authenticate header must NOT be set to prevent browser native dialogs, got %s", wAPI.Header().Get("WWW-Authenticate"))
 	}
 
-	// 3. 正确凭证 -> 200
-	req3 := httptest.NewRequest(http.MethodGet, "/", nil)
-	req3.SetBasicAuth("admin", "secretpassword")
-	w3 := httptest.NewRecorder()
-	handler.ServeHTTP(w3, req3)
-	if w3.Code != http.StatusOK {
-		t.Errorf("expected 200 for valid credentials, got %d", w3.Code)
+	// 3. API 请求携带错误凭据 -> 401
+	reqWrong := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	reqWrong.Header.Set("Authorization", "Bearer wrongpassword")
+	wWrong := httptest.NewRecorder()
+	handler.ServeHTTP(wWrong, reqWrong)
+	if wWrong.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for wrong token, got %d", wWrong.Code)
 	}
 
-	// 4. 正确 Bearer Token -> 200
-	req4 := httptest.NewRequest(http.MethodGet, "/", nil)
-	req4.Header.Set("Authorization", "Bearer secretpassword")
-	w4 := httptest.NewRecorder()
-	handler.ServeHTTP(w4, req4)
-	if w4.Code != http.StatusOK {
-		t.Errorf("expected 200 for valid Bearer token, got %d", w4.Code)
+	// 4. API 请求携带正确 Bearer Token -> 200
+	reqValid := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	reqValid.Header.Set("Authorization", "Bearer secretpassword")
+	wValid := httptest.NewRecorder()
+	handler.ServeHTTP(wValid, reqValid)
+	if wValid.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid Bearer token, got %d", wValid.Code)
 	}
 
-	// 5. 确保硬编码 "admin" 漏洞已被移除 (密码是 secretpassword 时传 admin 应返回 401)
-	req5 := httptest.NewRequest(http.MethodGet, "/", nil)
-	req5.Header.Set("Authorization", "Bearer admin")
-	w5 := httptest.NewRecorder()
-	handler.ServeHTTP(w5, req5)
-	if w5.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401 for 'admin' token when password is secretpassword, got %d", w5.Code)
+	// 5. API 请求携带 Basic Auth 格式凭据 -> 200
+	reqBasic := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	reqBasic.SetBasicAuth("", "secretpassword")
+	wBasic := httptest.NewRecorder()
+	handler.ServeHTTP(wBasic, reqBasic)
+	if wBasic.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid Basic auth password, got %d", wBasic.Code)
 	}
 }
 
