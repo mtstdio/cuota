@@ -11,12 +11,19 @@ import (
 
 // State 定义需要落盘持久化的数据结构
 type State struct {
-	Strategy        string            `json:"strategy"`
-	AccountAlias    map[string]string `json:"account_alias,omitempty"`
-	AccountAliases  map[string]string `json:"account_aliases,omitempty"`
-	AccountPriority map[string]int    `json:"account_priority"`
-	Decisions       []any             `json:"decisions"`
-	UpdatedAt       time.Time         `json:"updated_at"`
+	Strategy             string            `json:"strategy"`
+	AccountAlias         map[string]string `json:"account_alias,omitempty"`
+	AccountAliases       map[string]string `json:"account_aliases,omitempty"`
+	AccountPriority      map[string]int    `json:"account_priority"`
+	Decisions            []any             `json:"decisions"`
+	LastWarmupDate       string            `json:"last_warmup_date,omitempty"`
+	Timezone             string            `json:"timezone,omitempty"`
+	QuietHoursEnabled    *bool             `json:"quiet_hours_enabled,omitempty"`
+	QuietHoursStart      string            `json:"quiet_hours_start,omitempty"`
+	QuietHoursEnd        string            `json:"quiet_hours_end,omitempty"`
+	MorningWarmupEnabled *bool             `json:"morning_warmup_enabled,omitempty"`
+	MorningWarmupTime    string            `json:"morning_warmup_time,omitempty"`
+	UpdatedAt            time.Time         `json:"updated_at"`
 }
 
 // Store 管理本地 state.json 的安全原子读写

@@ -394,3 +394,70 @@ func TestCredentialHotReloadAndAutoRecovery(t *testing.T) {
 		t.Errorf("expected access token updated to new-fresh-token, got %s", ma.Account.AccessToken)
 	}
 }
+
+func TestMorningWarmupAndQuietHours(t *testing.T) {
+	loc := probe.ParseLocation("Asia/Shanghai")
+	tmpDir := t.TempDir()
+	authFile := filepath.Join(tmpDir, "codex-warm.json")
+	_ = os.WriteFile(authFile, []byte(`{"provider":"codex","access_token":"warm-token","disabled":false,"priority":0}`), 0644)
+
+	cfg := config.DefaultConfig()
+	cfg.CPA.AuthDir = tmpDir
+	cfg.Probe.Timezone = "Asia/Shanghai"
+	cfg.Probe.QuietHoursEnabled = true
+	cfg.Probe.QuietHoursStart = "01:00"
+	cfg.Probe.QuietHoursEnd = "07:30"
+	cfg.Probe.MorningWarmupEnabled = true
+	cfg.Probe.MorningWarmupTime = "07:30"
+
+	cpaClient := cpa.NewClient(cfg.CPA)
+	fetcher := quota.NewFetcher(cfg.Quota.RequestTimeout)
+	prober := probe.NewController(cfg.Probe)
+	mgr := NewManager(&cfg, cpaClient, fetcher, prober)
+
+	ctx := context.Background()
+	mgr.reconcile(ctx)
+
+	acctID := "codex-warm.json"
+	ma := mgr.accounts[acctID]
+	if ma == nil {
+		t.Fatalf("account %s not loaded", acctID)
+	}
+
+	// 1. 验证在夜间静默期（03:00）不会触发晨间预热
+	tNight := time.Date(2026, 10, 27, 3, 0, 0, 0, loc)
+	mgr.checkMorningWarmup(ctx, tNight)
+	if mgr.lastWarmupDate != "" {
+		t.Errorf("expected no warmup in quiet hours at 03:00, got %s", mgr.lastWarmupDate)
+	}
+
+	// 2. 模拟到达 07:30 晨间预热时刻
+	tWarmup := time.Date(2026, 10, 27, 7, 30, 0, 0, loc)
+	mgr.checkMorningWarmup(ctx, tWarmup)
+	if mgr.lastWarmupDate != "2026-10-27" {
+		t.Errorf("expected lastWarmupDate=2026-10-27 after 07:30 warmup, got %s", mgr.lastWarmupDate)
+	}
+
+	// 3. 同一天再次检查（例如 07:35），不应重复触发
+	prevWarmupDate := mgr.lastWarmupDate
+	tWarmupLater := time.Date(2026, 10, 27, 7, 35, 0, 0, loc)
+	mgr.checkMorningWarmup(ctx, tWarmupLater)
+	if mgr.lastWarmupDate != prevWarmupDate {
+		t.Errorf("expected lastWarmupDate to remain unchanged on second call")
+	}
+
+	// 4. 测试动态配置修改 UpdateProbeConfig
+	qStart := "00:30"
+	qEnd := "08:00"
+	f := false
+	mgr.UpdateProbeConfig("Asia/Shanghai", &f, qStart, qEnd, nil, "")
+	if mgr.cfg.Probe.QuietHoursEnabled != false {
+		t.Errorf("expected quiet_hours_enabled=false")
+	}
+	if mgr.cfg.Probe.QuietHoursStart != "00:30" {
+		t.Errorf("expected quiet_hours_start=00:30")
+	}
+	if mgr.cfg.Probe.QuietHoursEnd != "08:00" {
+		t.Errorf("expected quiet_hours_end=08:00")
+	}
+}

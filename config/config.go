@@ -39,11 +39,17 @@ type QuotaConfig struct {
 }
 
 type ProbeConfig struct {
-	Enabled        bool          `yaml:"enabled"`
-	Model          string        `yaml:"model"`
-	Endpoint       string        `yaml:"endpoint"`
-	Timeout        time.Duration `yaml:"timeout"`
-	PostResetDelay time.Duration `yaml:"post_reset_delay"`
+	Enabled              bool          `yaml:"enabled"`
+	Model                string        `yaml:"model"`
+	Endpoint             string        `yaml:"endpoint"`
+	Timeout              time.Duration `yaml:"timeout"`
+	PostResetDelay       time.Duration `yaml:"post_reset_delay"`
+	Timezone             string        `yaml:"timezone"`
+	QuietHoursEnabled    bool          `yaml:"quiet_hours_enabled"`
+	QuietHoursStart      string        `yaml:"quiet_hours_start"`
+	QuietHoursEnd        string        `yaml:"quiet_hours_end"`
+	MorningWarmupEnabled bool          `yaml:"morning_warmup_enabled"`
+	MorningWarmupTime    string        `yaml:"morning_warmup_time"`
 }
 
 type SchedulerConfig struct {
@@ -73,11 +79,17 @@ func DefaultConfig() Config {
 			RequestTimeout:      15 * time.Second,
 		},
 		Probe: ProbeConfig{
-			Enabled:        true,
-			Model:          "gpt-5.6-luna",
-			Endpoint:       "https://chatgpt.com/backend-api/codex/responses",
-			Timeout:        30 * time.Second,
-			PostResetDelay: 1 * time.Minute,
+			Enabled:              true,
+			Model:                "gpt-5.6-luna",
+			Endpoint:             "https://chatgpt.com/backend-api/codex/responses",
+			Timeout:              30 * time.Second,
+			PostResetDelay:       1 * time.Minute,
+			Timezone:             "Asia/Shanghai",
+			QuietHoursEnabled:    true,
+			QuietHoursStart:      "01:00",
+			QuietHoursEnd:        "07:30",
+			MorningWarmupEnabled: true,
+			MorningWarmupTime:    "07:30",
 		},
 		Scheduler: SchedulerConfig{
 			Strategy: "fill_first",

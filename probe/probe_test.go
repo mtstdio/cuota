@@ -206,3 +206,60 @@ func TestProbeSuppressionAndBackoff(t *testing.T) {
 		t.Errorf("expected backoff ~20m after 2 fails, got %v", until2)
 	}
 }
+
+func TestQuietHours(t *testing.T) {
+	loc := ParseLocation("Asia/Shanghai")
+
+	ctrl := NewController(config.ProbeConfig{
+		Enabled:           true,
+		Timezone:          "Asia/Shanghai",
+		QuietHoursEnabled: true,
+		QuietHoursStart:   "01:00",
+		QuietHoursEnd:     "07:30",
+	})
+
+	// 1. 静默时段内 (比如 03:30)
+	tQuiet := time.Date(2026, 10, 27, 3, 30, 0, 0, loc)
+	if !ctrl.IsInQuietHours(tQuiet) {
+		t.Errorf("expected tQuiet (03:30) to be in quiet hours")
+	}
+
+	// 2. 静默起始临界点 (01:00 应处于静默期)
+	tStart := time.Date(2026, 10, 27, 1, 0, 0, 0, loc)
+	if !ctrl.IsInQuietHours(tStart) {
+		t.Errorf("expected tStart (01:00) to be in quiet hours")
+	}
+
+	// 3. 静默结束临界点 (07:30 应离开静默期)
+	tEnd := time.Date(2026, 10, 27, 7, 30, 0, 0, loc)
+	if ctrl.IsInQuietHours(tEnd) {
+		t.Errorf("expected tEnd (07:30) to NOT be in quiet hours")
+	}
+
+	// 4. 白天工作时间 (10:00)
+	tDay := time.Date(2026, 10, 27, 10, 0, 0, 0, loc)
+	if ctrl.IsInQuietHours(tDay) {
+		t.Errorf("expected tDay (10:00) to NOT be in quiet hours")
+	}
+
+	// 5. 跨午夜静默配置测试 (23:00 - 07:30)
+	ctrlCross := NewController(config.ProbeConfig{
+		Enabled:           true,
+		Timezone:          "Asia/Shanghai",
+		QuietHoursEnabled: true,
+		QuietHoursStart:   "23:00",
+		QuietHoursEnd:     "07:30",
+	})
+	tLateNight := time.Date(2026, 10, 27, 23, 30, 0, 0, loc)
+	tEarlyMorning := time.Date(2026, 10, 28, 5, 0, 0, 0, loc)
+	tAfternoon := time.Date(2026, 10, 28, 14, 0, 0, 0, loc)
+	if !ctrlCross.IsInQuietHours(tLateNight) {
+		t.Errorf("expected 23:30 to be in quiet hours with overnight config")
+	}
+	if !ctrlCross.IsInQuietHours(tEarlyMorning) {
+		t.Errorf("expected 05:00 to be in quiet hours with overnight config")
+	}
+	if ctrlCross.IsInQuietHours(tAfternoon) {
+		t.Errorf("expected 14:00 to NOT be in quiet hours with overnight config")
+	}
+}

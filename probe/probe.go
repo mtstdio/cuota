@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -89,12 +91,85 @@ func (c *Controller) updateSuppressionLocked(accountID string, success bool, now
 	}
 }
 
+func (c *Controller) UpdateConfig(cfg config.ProbeConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cfg = cfg
+}
+
+func (c *Controller) Config() config.ProbeConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cfg
+}
+
+// ParseTimeMinutes parses a "HH:MM" string into minutes of the day (0-1439).
+func ParseTimeMinutes(s string) (int, error) {
+	parts := strings.Split(strings.TrimSpace(s), ":")
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("invalid time format: %q", s)
+	}
+	h, err := strconv.Atoi(parts[0])
+	if err != nil || h < 0 || h > 23 {
+		return 0, fmt.Errorf("invalid hour: %q", parts[0])
+	}
+	m, err := strconv.Atoi(parts[1])
+	if err != nil || m < 0 || m > 59 {
+		return 0, fmt.Errorf("invalid minute: %q", parts[1])
+	}
+	return h*60 + m, nil
+}
+
+// ParseLocation parses timezone name, fallback to Asia/Shanghai (+8)
+func ParseLocation(tz string) *time.Location {
+	if strings.TrimSpace(tz) == "" {
+		return time.FixedZone("CST", 8*3600)
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return time.FixedZone("CST", 8*3600)
+	}
+	return loc
+}
+
+func (c *Controller) IsInQuietHours(t time.Time) bool {
+	c.mu.RLock()
+	cfg := c.cfg
+	c.mu.RUnlock()
+
+	if !cfg.QuietHoursEnabled {
+		return false
+	}
+
+	startMin, err1 := ParseTimeMinutes(cfg.QuietHoursStart)
+	endMin, err2 := ParseTimeMinutes(cfg.QuietHoursEnd)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+
+	loc := ParseLocation(cfg.Timezone)
+	localT := t.In(loc)
+	curMin := localT.Hour()*60 + localT.Minute()
+
+	if startMin < endMin {
+		return curMin >= startMin && curMin < endMin
+	} else if startMin > endMin {
+		// 跨午夜情况，如 23:00 - 07:30
+		return curMin >= startMin || curMin < endMin
+	}
+	return false
+}
+
 func (c *Controller) ShouldProbeDrift(q *quota.AccountQuota, lastResetAt time.Time) bool {
 	if !c.cfg.Enabled || q == nil || !q.IsUsable || q.FiveHour == nil {
 		return false
 	}
 
 	now := time.Now()
+	if c.IsInQuietHours(now) {
+		return false
+	}
+
 	if suppressed, _ := c.IsSuppressed(q.AccountID, now); suppressed {
 		return false
 	}
@@ -115,6 +190,10 @@ func (c *Controller) ShouldProbe(q *quota.AccountQuota) bool {
 	}
 
 	now := time.Now()
+	if c.IsInQuietHours(now) {
+		return false
+	}
+
 	if suppressed, _ := c.IsSuppressed(q.AccountID, now); suppressed {
 		return false
 	}

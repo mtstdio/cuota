@@ -473,6 +473,49 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if pm, ok := patch["probe_model"].(string); ok && pm != "" {
 			s.scheduler.Config().Probe.Model = pm
 		}
+
+		// 7. quiet_hours & morning_warmup settings
+		var tz string
+		var qEnabled *bool
+		var qStart, qEnd string
+		var wEnabled *bool
+		var wTime string
+		hasProbeUpdate := false
+
+		if qh, ok := patch["quiet_hours_enabled"].(bool); ok {
+			qEnabled = &qh
+			hasProbeUpdate = true
+			changes = append(changes, map[string]any{"field": "quiet_hours_enabled", "to": qh, "effect": "Immediate"})
+		}
+		if qs, ok := patch["quiet_hours_start"].(string); ok && qs != "" {
+			qStart = qs
+			hasProbeUpdate = true
+			changes = append(changes, map[string]any{"field": "quiet_hours_start", "to": qs, "effect": "Immediate"})
+		}
+		if qe, ok := patch["quiet_hours_end"].(string); ok && qe != "" {
+			qEnd = qe
+			hasProbeUpdate = true
+			changes = append(changes, map[string]any{"field": "quiet_hours_end", "to": qe, "effect": "Immediate"})
+		}
+		if mw, ok := patch["morning_warmup_enabled"].(bool); ok {
+			wEnabled = &mw
+			hasProbeUpdate = true
+			changes = append(changes, map[string]any{"field": "morning_warmup_enabled", "to": mw, "effect": "Immediate"})
+		}
+		if mt, ok := patch["morning_warmup_time"].(string); ok && mt != "" {
+			wTime = mt
+			hasProbeUpdate = true
+			changes = append(changes, map[string]any{"field": "morning_warmup_time", "to": mt, "effect": "Immediate"})
+		}
+		if tzone, ok := patch["timezone"].(string); ok && tzone != "" {
+			tz = tzone
+			hasProbeUpdate = true
+			changes = append(changes, map[string]any{"field": "timezone", "to": tzone, "effect": "Immediate"})
+		}
+
+		if hasProbeUpdate {
+			s.scheduler.UpdateProbeConfig(tz, qEnabled, qStart, qEnd, wEnabled, wTime)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{

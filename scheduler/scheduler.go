@@ -90,6 +90,7 @@ type Manager struct {
 	refreshCh      chan struct{}
 	decisions      []DecisionView
 	nextDecisionID uint64
+	lastWarmupDate string
 }
 
 func NewManager(cfg *config.Config, cpaClient *cpa.Client, fetcher *quota.Fetcher, prober *probe.Controller, st ...*store.Store) *Manager {
@@ -122,6 +123,30 @@ func NewManager(cfg *config.Config, cpaClient *cpa.Client, fetcher *quota.Fetche
 			}
 			if loaded.AccountPriority != nil {
 				m.accountPrios = loaded.AccountPriority
+			}
+			if loaded.LastWarmupDate != "" {
+				m.lastWarmupDate = loaded.LastWarmupDate
+			}
+			if loaded.Timezone != "" {
+				m.cfg.Probe.Timezone = loaded.Timezone
+			}
+			if loaded.QuietHoursEnabled != nil {
+				m.cfg.Probe.QuietHoursEnabled = *loaded.QuietHoursEnabled
+			}
+			if loaded.QuietHoursStart != "" {
+				m.cfg.Probe.QuietHoursStart = loaded.QuietHoursStart
+			}
+			if loaded.QuietHoursEnd != "" {
+				m.cfg.Probe.QuietHoursEnd = loaded.QuietHoursEnd
+			}
+			if loaded.MorningWarmupEnabled != nil {
+				m.cfg.Probe.MorningWarmupEnabled = *loaded.MorningWarmupEnabled
+			}
+			if loaded.MorningWarmupTime != "" {
+				m.cfg.Probe.MorningWarmupTime = loaded.MorningWarmupTime
+			}
+			if m.prober != nil {
+				m.prober.UpdateConfig(m.cfg.Probe)
 			}
 			if len(loaded.Decisions) > 0 {
 				for _, raw := range loaded.Decisions {
@@ -159,16 +184,55 @@ func (m *Manager) saveStateLocked() {
 		priosCopy[k] = v
 	}
 
+	quietHoursEnabled := m.cfg.Probe.QuietHoursEnabled
+	morningWarmupEnabled := m.cfg.Probe.MorningWarmupEnabled
+
 	st := &store.State{
-		Strategy:        m.cfg.Scheduler.Strategy,
-		AccountAliases:  aliasesCopy,
-		AccountPriority: priosCopy,
-		Decisions:       decList,
-		UpdatedAt:       time.Now(),
+		Strategy:             m.cfg.Scheduler.Strategy,
+		AccountAliases:       aliasesCopy,
+		AccountPriority:      priosCopy,
+		Decisions:            decList,
+		LastWarmupDate:       m.lastWarmupDate,
+		Timezone:             m.cfg.Probe.Timezone,
+		QuietHoursEnabled:    &quietHoursEnabled,
+		QuietHoursStart:      m.cfg.Probe.QuietHoursStart,
+		QuietHoursEnd:        m.cfg.Probe.QuietHoursEnd,
+		MorningWarmupEnabled: &morningWarmupEnabled,
+		MorningWarmupTime:    m.cfg.Probe.MorningWarmupTime,
+		UpdatedAt:            time.Now(),
 	}
 	if err := m.store.Save(st); err != nil {
 		log.Printf("[Scheduler] Error saving state: %v", err)
 	}
+}
+
+func (m *Manager) UpdateProbeConfig(timezone string, quietHoursEnabled *bool, quietStart, quietEnd string, warmupEnabled *bool, warmupTime string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if timezone != "" {
+		m.cfg.Probe.Timezone = timezone
+	}
+	if quietHoursEnabled != nil {
+		m.cfg.Probe.QuietHoursEnabled = *quietHoursEnabled
+	}
+	if quietStart != "" {
+		m.cfg.Probe.QuietHoursStart = quietStart
+	}
+	if quietEnd != "" {
+		m.cfg.Probe.QuietHoursEnd = quietEnd
+	}
+	if warmupEnabled != nil {
+		m.cfg.Probe.MorningWarmupEnabled = *warmupEnabled
+	}
+	if warmupTime != "" {
+		m.cfg.Probe.MorningWarmupTime = warmupTime
+	}
+
+	if m.prober != nil {
+		m.prober.UpdateConfig(m.cfg.Probe)
+	}
+	m.saveStateLocked()
 }
 
 func (m *Manager) SetStrategy(strategy string) error {
@@ -309,6 +373,9 @@ func (m *Manager) reconcile(ctx context.Context) {
 
 	// 2. 执行 Fill-First 调度决断与主账号切换
 	m.evaluateActiveAccount()
+
+	// 3. 检查晨间批量预热（东八区 07:30）
+	m.checkMorningWarmup(ctx, time.Now())
 }
 
 func (m *Manager) reconcileSingleAccount(ctx context.Context, acct *cpa.Account) {
@@ -377,34 +444,38 @@ func (m *Manager) reconcileSingleAccount(ctx context.Context, acct *cpa.Account)
 
 	// 探测仅针对 Codex 账号（Claude 无需也无 ChatGPT responses 探活接口）
 	if acct.Provider != "claude" {
-		// 1. 冷却到期直接激活 (Cooldown Expiration Immediate Probe)
-		if managed.State == StateCooldown && !managed.LockedResetAt.IsZero() && now.After(managed.LockedResetAt) && q.FiveHour != nil && q.FiveHour.UsedPercent == 0 {
-			log.Printf("[Scheduler] Account %s reached cooldown reset time with 0%% usage, triggering probe...", acct.ID)
-			m.recordDecision(DecisionView{
-				Provider: "codex",
-				Model:    m.cfg.Probe.Model,
-				Outcome:  "new_session",
-				Cause:    fmt.Sprintf("账号 %s 5h 冷却周期结束到达重置点，自动触发 Probe 激活", acct.ID),
-				AuthID:   acct.ID,
-			})
-			m.executeProbeAndRefresh(ctx, acct, managed)
-			return
-		}
+		inQuiet := m.prober != nil && m.prober.IsInQuietHours(now)
 
-		// 2. 连续两轮比对重置漂移（Drift Detection for Lazy Window）
-		if q.FiveHour != nil && q.FiveHour.UsedPercent == 0 && !managed.LastResetAt.IsZero() {
-			drift := q.FiveHour.ResetAt.Sub(managed.LastResetAt)
-			if drift >= 3*time.Second {
-				log.Printf("[Scheduler] Account %s detected reset drift (+%v), lazy window confirmed, triggering probe...", acct.ID, drift)
+		if !inQuiet {
+			// 1. 冷却到期直接激活 (Cooldown Expiration Immediate Probe)
+			if managed.State == StateCooldown && !managed.LockedResetAt.IsZero() && now.After(managed.LockedResetAt) && q.FiveHour != nil && q.FiveHour.UsedPercent == 0 {
+				log.Printf("[Scheduler] Account %s reached cooldown reset time with 0%% usage, triggering probe...", acct.ID)
 				m.recordDecision(DecisionView{
 					Provider: "codex",
 					Model:    m.cfg.Probe.Model,
 					Outcome:  "new_session",
-					Cause:    fmt.Sprintf("账号 %s 5h 倒计时未启动（重置点向后漂移 +%v），自动触发 Probe 激活", acct.ID, drift.Round(time.Second)),
+					Cause:    fmt.Sprintf("账号 %s 5h 冷却周期结束到达重置点，自动触发 Probe 激活", acct.ID),
 					AuthID:   acct.ID,
 				})
 				m.executeProbeAndRefresh(ctx, acct, managed)
 				return
+			}
+
+			// 2. 连续两轮比对重置漂移（Drift Detection for Lazy Window）
+			if q.FiveHour != nil && q.FiveHour.UsedPercent == 0 && !managed.LastResetAt.IsZero() {
+				drift := q.FiveHour.ResetAt.Sub(managed.LastResetAt)
+				if drift >= 3*time.Second {
+					log.Printf("[Scheduler] Account %s detected reset drift (+%v), lazy window confirmed, triggering probe...", acct.ID, drift)
+					m.recordDecision(DecisionView{
+						Provider: "codex",
+						Model:    m.cfg.Probe.Model,
+						Outcome:  "new_session",
+						Cause:    fmt.Sprintf("账号 %s 5h 倒计时未启动（重置点向后漂移 +%v），自动触发 Probe 激活", acct.ID, drift.Round(time.Second)),
+						AuthID:   acct.ID,
+					})
+					m.executeProbeAndRefresh(ctx, acct, managed)
+					return
+				}
 			}
 		}
 
@@ -717,6 +788,112 @@ func (m *Manager) executeProbeAndRefresh(ctx context.Context, acct *cpa.Account,
 			m.setAccountState(acct.ID, StateReady, "5h 额度已激活恢复，就绪待命")
 		}
 	}
+}
+
+func (m *Manager) checkMorningWarmup(ctx context.Context, now time.Time) {
+	m.mu.Lock()
+	cfg := m.cfg.Probe
+	loc := probe.ParseLocation(cfg.Timezone)
+	localNow := now.In(loc)
+	todayStr := localNow.Format("2006-01-02")
+
+	if !cfg.Enabled || !cfg.MorningWarmupEnabled {
+		m.mu.Unlock()
+		return
+	}
+
+	if m.lastWarmupDate == todayStr {
+		m.mu.Unlock()
+		return
+	}
+
+	warmupMin, err := probe.ParseTimeMinutes(cfg.MorningWarmupTime)
+	if err != nil {
+		m.mu.Unlock()
+		return
+	}
+
+	curMin := localNow.Hour()*60 + localNow.Minute()
+	if curMin < warmupMin || curMin >= warmupMin+60 {
+		m.mu.Unlock()
+		return
+	}
+
+	m.lastWarmupDate = todayStr
+	m.saveStateLocked()
+	m.mu.Unlock()
+
+	log.Printf("[Scheduler] Morning warmup triggered for %s (local time %s, timezone %s)", todayStr, localNow.Format("15:04:05"), cfg.Timezone)
+	m.executeMorningWarmup(ctx, cfg.MorningWarmupTime)
+}
+
+func (m *Manager) executeMorningWarmup(ctx context.Context, warmupTime string) {
+	if m.prober == nil {
+		return
+	}
+
+	m.mu.RLock()
+	var toWarmup []*cpa.Account
+	for _, ma := range m.accounts {
+		if ma.Account == nil || ma.Account.Disabled || ma.Account.Provider == "claude" {
+			continue
+		}
+		if ma.Circuit.State == CircuitOpen {
+			continue
+		}
+		toWarmup = append(toWarmup, ma.Account)
+	}
+	m.mu.RUnlock()
+
+	if len(toWarmup) == 0 {
+		log.Printf("[Scheduler] Morning warmup: no eligible codex accounts to probe")
+		return
+	}
+
+	log.Printf("[Scheduler] Morning warmup: activating %d accounts...", len(toWarmup))
+	m.recordDecision(DecisionView{
+		Provider: "codex",
+		Model:    m.cfg.Probe.Model,
+		Outcome:  "new_session",
+		Cause:    fmt.Sprintf("晨间定时预热（%s），批量激活锁定 %d 个可用账号 5h 窗口 (07:30-12:30)", warmupTime, len(toWarmup)),
+	})
+
+	for _, acct := range toWarmup {
+		if ctx.Err() != nil {
+			return
+		}
+		m.mu.RLock()
+		managed, ok := m.accounts[acct.ID]
+		m.mu.RUnlock()
+		if !ok {
+			continue
+		}
+
+		ev, probeErr := m.prober.ExecuteForced(ctx, acct)
+		if probeErr == nil && ev != nil && ev.Success {
+			m.mu.Lock()
+			managed.LastProbeAt = time.Now()
+			m.mu.Unlock()
+
+			time.Sleep(1 * time.Second)
+			freshQ, fetchErr := m.fetcher.Fetch(acct)
+			if fetchErr == nil && freshQ != nil {
+				m.mu.Lock()
+				managed.Quota = freshQ
+				if freshQ.FiveHour != nil {
+					managed.LastResetAt = freshQ.FiveHour.ResetAt
+					managed.LockedResetAt = time.Time{}
+				}
+				m.mu.Unlock()
+			}
+			if managed.State == StateCooldown {
+				m.setAccountState(acct.ID, StateReady, "晨间预热激活就绪")
+			}
+		} else {
+			log.Printf("[Scheduler] Morning warmup probe for %s failed: %v", acct.ID, probeErr)
+		}
+	}
+	log.Printf("[Scheduler] Morning warmup finished for %d accounts.", len(toWarmup))
 }
 
 func (m *Manager) ManualProbe(ctx context.Context, accountID string) (*probe.Event, error) {
@@ -1197,6 +1374,54 @@ func (m *Manager) SettingsView() map[string]any {
 			"effect":      "Applied on next probe.",
 		},
 		{
+			"name":        "quiet_hours_enabled",
+			"type":        "boolean",
+			"default":     true,
+			"group":       "Diagnostics",
+			"description": "Enable quiet hours to pause automated probes (preserves 100% quota via lazy drift).",
+			"effect":      "Pauses background probe activation during the quiet window.",
+		},
+		{
+			"name":        "quiet_hours_start",
+			"type":        "string",
+			"default":     "01:00",
+			"group":       "Diagnostics",
+			"description": "Quiet hours start time (HH:MM).",
+			"effect":      "Probing paused starting at this time.",
+		},
+		{
+			"name":        "quiet_hours_end",
+			"type":        "string",
+			"default":     "07:30",
+			"group":       "Diagnostics",
+			"description": "Quiet hours end time (HH:MM).",
+			"effect":      "Probing resumed at this time.",
+		},
+		{
+			"name":        "morning_warmup_enabled",
+			"type":        "boolean",
+			"default":     true,
+			"group":       "Diagnostics",
+			"description": "Enable daily morning warmup to lock 5h reset countdown for all healthy accounts.",
+			"effect":      "Probes all eligible accounts at warmup time to lock 07:30-12:30 window.",
+		},
+		{
+			"name":        "morning_warmup_time",
+			"type":        "string",
+			"default":     "07:30",
+			"group":       "Diagnostics",
+			"description": "Morning warmup trigger time (HH:MM).",
+			"effect":      "Triggers batch probe at this time daily.",
+		},
+		{
+			"name":        "timezone",
+			"type":        "string",
+			"default":     "Asia/Shanghai",
+			"group":       "Diagnostics",
+			"description": "Local timezone used for quiet hours and morning warmup schedule.",
+			"effect":      "Timezone reference for schedules.",
+		},
+		{
 			"name":        "auth_dir",
 			"type":        "string",
 			"default":     m.cfg.CPA.AuthDir,
@@ -1215,6 +1440,12 @@ func (m *Manager) SettingsView() map[string]any {
 			"probe_enabled":         m.cfg.Probe.Enabled,
 			"probe_model":           m.cfg.Probe.Model,
 			"probe_endpoint":        m.cfg.Probe.Endpoint,
+			"quiet_hours_enabled":    m.cfg.Probe.QuietHoursEnabled,
+			"quiet_hours_start":      m.cfg.Probe.QuietHoursStart,
+			"quiet_hours_end":        m.cfg.Probe.QuietHoursEnd,
+			"morning_warmup_enabled": m.cfg.Probe.MorningWarmupEnabled,
+			"morning_warmup_time":    m.cfg.Probe.MorningWarmupTime,
+			"timezone":               m.cfg.Probe.Timezone,
 			"cpa_base_url":          m.cfg.CPA.BaseURL,
 			"auth_dir":              m.cfg.CPA.AuthDir,
 		},
