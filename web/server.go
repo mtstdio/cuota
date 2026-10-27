@@ -37,7 +37,13 @@ func NewServer(cfg config.ServerConfig, sm *scheduler.Manager) *Server {
 }
 
 func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
-	if s.cfg.Username == "" && s.cfg.Password == "" {
+	expectedPass := s.cfg.Password
+	if expectedPass == "" && s.scheduler != nil && s.scheduler.Config() != nil {
+		expectedPass = s.scheduler.Config().CPA.SecretKey
+	}
+	expectedUser := s.cfg.Username
+
+	if expectedUser == "" && expectedPass == "" {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +51,7 @@ func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
 		authHeader := r.Header.Get("Authorization")
 		if strings.HasPrefix(authHeader, "Bearer ") {
 			token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
-			if token != "" && (token == s.cfg.Password || token == s.cfg.Username || token == "admin") {
+			if token != "" && expectedPass != "" && subtle.ConstantTimeCompare([]byte(token), []byte(expectedPass)) == 1 {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -53,10 +59,13 @@ func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
 
 		// 2. HTTP Basic 校验
 		user, pass, ok := r.BasicAuth()
-		if ok && subtle.ConstantTimeCompare([]byte(user), []byte(s.cfg.Username)) == 1 &&
-			subtle.ConstantTimeCompare([]byte(pass), []byte(s.cfg.Password)) == 1 {
-			next.ServeHTTP(w, r)
-			return
+		if ok {
+			userMatch := (expectedUser == "" || subtle.ConstantTimeCompare([]byte(user), []byte(expectedUser)) == 1)
+			passMatch := (expectedPass == "" || subtle.ConstantTimeCompare([]byte(pass), []byte(expectedPass)) == 1)
+			if userMatch && passMatch {
+				next.ServeHTTP(w, r)
+				return
+			}
 		}
 
 		w.Header().Set("WWW-Authenticate", `Basic realm="Cuota Management"`)

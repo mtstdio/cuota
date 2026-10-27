@@ -98,6 +98,24 @@ func TestBasicAuthMiddleware(t *testing.T) {
 	if w3.Code != http.StatusOK {
 		t.Errorf("expected 200 for valid credentials, got %d", w3.Code)
 	}
+
+	// 4. 正确 Bearer Token -> 200
+	req4 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req4.Header.Set("Authorization", "Bearer secretpassword")
+	w4 := httptest.NewRecorder()
+	handler.ServeHTTP(w4, req4)
+	if w4.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid Bearer token, got %d", w4.Code)
+	}
+
+	// 5. 确保硬编码 "admin" 漏洞已被移除 (密码是 secretpassword 时传 admin 应返回 401)
+	req5 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req5.Header.Set("Authorization", "Bearer admin")
+	w5 := httptest.NewRecorder()
+	handler.ServeHTTP(w5, req5)
+	if w5.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for 'admin' token when password is secretpassword, got %d", w5.Code)
+	}
 }
 
 func TestBasePathRouting(t *testing.T) {

@@ -1,5 +1,5 @@
-// Management API client. The management key lives only in this module's
-// memory: never in localStorage, sessionStorage, cookies, or the URL.
+// Management API client.
+// The management key is saved in localStorage for persistent login across tab reloads.
 
 export const PLUGIN_ID = "kpatdev-quota-router";
 
@@ -10,12 +10,43 @@ export function getBasePrefix(): string {
 
 export const API_BASE = `/v0/management/plugins/${PLUGIN_ID}`;
 
-let managementKey = "admin";
+const STORAGE_KEY = "cuota_mgmt_key";
+
+function initialKey(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY) || sessionStorage.getItem(STORAGE_KEY);
+    if (saved) return saved.trim();
+  } catch {
+    /* ignore storage access error */
+  }
+  return "";
+}
+
+let managementKey = initialKey();
 const listeners = new Set<() => void>();
 
-export function setKey(key: string) {
-  managementKey = key;
+export function setKey(key: string, persist: boolean = true) {
+  managementKey = key.trim();
+  try {
+    if (managementKey) {
+      if (persist) {
+        localStorage.setItem(STORAGE_KEY, managementKey);
+      } else {
+        sessionStorage.setItem(STORAGE_KEY, managementKey);
+      }
+    } else {
+      localStorage.removeItem(STORAGE_KEY);
+      sessionStorage.removeItem(STORAGE_KEY);
+    }
+  } catch {
+    /* ignore storage access error */
+  }
   listeners.forEach((l) => l());
+}
+
+export function clearKey() {
+  setKey("");
 }
 
 export function hasKey() {
@@ -66,8 +97,7 @@ export async function request<T>(path: string, init: { method?: string; body?: u
   if (!res.ok) {
     if (res.status === 401 || res.status === 403) {
       // A rejected key is dropped so the sign-in screen returns.
-      managementKey = "";
-      listeners.forEach((l) => l());
+      clearKey();
     }
     const b = body as { error?: string; message?: string } | undefined;
     throw new ApiError(res.status, b?.error ?? `http_${res.status}`, b?.message ?? messageFor(res.status), body);

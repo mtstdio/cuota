@@ -1,5 +1,5 @@
 import { useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
-import { hasKey, onKeyChange, request, setKey } from "./api";
+import { clearKey, hasKey, onKeyChange, request, setKey } from "./api";
 import { IconAccounts, IconActivity, IconLogout, IconMenu, IconMoon, IconOverview, IconRefresh, IconSearch, IconSessions, IconSettings, IconSun, IconUsage, Logo } from "./components/icons";
 import { Banner, Pill, Seg } from "./components/ui";
 import { relative } from "./format";
@@ -80,18 +80,20 @@ export function App() {
 
 function Login() {
   const [value, setValue] = useState("");
+  const [remember, setRemember] = useState(true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
     setError("");
-    setKey(value.trim());
+    const trimmed = value.trim();
+    setKey(trimmed, remember);
     try {
       await request("/settings");
       setValue("");
     } catch (err) {
-      setKey("");
+      clearKey();
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
@@ -111,7 +113,11 @@ function Login() {
         <div className="field">
           <label htmlFor="key">Management key</label>
           <input id="key" className="input" type="password" autoComplete="off" spellCheck={false} value={value} onChange={(e) => setValue(e.target.value)} autoFocus required />
-          <span className="hint">The same key as CLIProxyAPI's management panel. It stays in this tab's memory and is forgotten when you close or reload it.</span>
+          <span className="hint">CLIProxyAPI 管理密钥或 Cuota 配置密码。已支持本地凭据持久化，刷新页面无需重复输入。</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "4px 0 12px 0", fontSize: 13 }}>
+          <input id="remember" type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} style={{ cursor: "pointer" }} />
+          <label htmlFor="remember" style={{ cursor: "pointer", userSelect: "none" }} className="muted">记住登录状态 (Remember key in browser)</label>
         </div>
         {error && <div className="error-text" role="alert">{error}</div>}
         <button className="btn primary" type="submit" disabled={busy || !value.trim()}>{busy ? "Checking…" : "Connect"}</button>
@@ -181,7 +187,7 @@ function Shell({ theme, toggleTheme }: { theme: "dark" | "light"; toggleTheme: (
             <button className="btn sm ghost" onClick={toggleTheme} aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}>
               {theme === "dark" ? <IconSun /> : <IconMoon />} {theme === "dark" ? "Light" : "Dark"}
             </button>
-            <button className="btn sm ghost" onClick={() => setKey("")} aria-label="Sign out and forget the management key">
+            <button className="btn sm ghost" onClick={() => clearKey()} aria-label="Sign out and forget the management key">
               <IconLogout /> Sign out
             </button>
           </div>
@@ -218,6 +224,9 @@ function Shell({ theme, toggleTheme }: { theme: "dark" | "light"; toggleTheme: (
           </span>
           <button className="btn icon" aria-label="Reload data" onClick={() => void overview.reload()} disabled={overview.loading}>
             <IconRefresh />
+          </button>
+          <button className="btn icon ghost" title="Sign out" aria-label="Sign out" onClick={() => clearKey()}>
+            <IconLogout />
           </button>
         </header>
         <main className="content" id="main">
